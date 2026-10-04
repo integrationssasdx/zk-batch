@@ -28,6 +28,13 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
   - 消息中不包含 `proof` 与 `public_inputs` 内容；各模型均提供固定键序的
     `to_dict()`。
 - `VerificationQueue` —— 内存中的串行作业队列，不起线程、不联网、不落盘。
+  作业执行时一次走完整的详细验证流水线并保存报告：
+  - `result(job_id)` 返回该次执行的 `BatchVerificationResult`；
+  - `report(job_id)` 返回同一次执行的 `BatchVerificationReport`
+    （`report(job_id).result is result(job_id)`），给出聚合调用、聚合验证、
+    回退单证验证各阶段的组级状态；查询报告不再次调用验证器，也不改变作业
+    状态。仅 completed 作业可取结果/报告，queued/running/cancelled 抛
+    `ResultUnavailableError`，未知或因执行错误移除的作业抛 `UnknownJobError`。
 
 ## 约定
 
