@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 
 # 分组键：protocol / circuit_id / aggregation_key
@@ -90,6 +90,52 @@ class BatchVerificationResult:
             "failed": self.failed,
             "failures": [f.to_dict() for f in self.failures],
         }
+
+    def failure_groups(self) -> List[Dict[str, Any]]:
+        """按聚合组汇总失败定位，返回分组摘要列表；无失败时返回空列表。
+
+        仅提供已有 ``failures`` 的分组视图，不改动失败记录本身。摘要按
+        ``group_id`` 升序，组内明细按 ``proof_id`` 升序；同一 proof_id 的
+        多条记录（如 rejected 与 verify_error 并存）保持相对次序。
+        每个摘要固定包含：
+
+        * ``group_id`` ——分组标识；
+        * ``failed_proof_ids`` ——该组失败证明 id（按 proof_id 升序、去重）；
+        * ``failed_count`` ——该组失败证明数（按证明去重计数）；
+        * ``failures`` ——该组失败明细列表，每项含 Failure 的
+          ``proof_id``/``stage``/``code``/``message``（``group_id`` 已在
+          摘要上，不在明细中重复）。
+        """
+        grouped: Dict[str, List[Failure]] = {}
+        for failure in self.failures:
+            grouped.setdefault(failure.group_id, []).append(failure)
+
+        summaries: List[Dict[str, Any]] = []
+        for group_id in sorted(grouped):
+            # self.failures 已按 proof_id 排序；显式再排一次，保证直接构造
+            # 的结果重复调用时顺序同样稳定。
+            members = sorted(
+                grouped[group_id],
+                key=lambda f: (f.proof_id, f.stage, f.code, f.message),
+            )
+            proof_ids = sorted({f.proof_id for f in members})
+            summaries.append(
+                {
+                    "group_id": group_id,
+                    "failed_proof_ids": proof_ids,
+                    "failed_count": len(proof_ids),
+                    "failures": [
+                        {
+                            "proof_id": f.proof_id,
+                            "stage": f.stage,
+                            "code": f.code,
+                            "message": f.message,
+                        }
+                        for f in members
+                    ],
+                }
+            )
+        return summaries
 
 
 @dataclass

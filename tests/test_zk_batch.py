@@ -373,6 +373,182 @@ class TestVerificationFlow(unittest.TestCase):
         self.assertIs(seen["p1"].proof, sentinel_proof)
 
 
+# ================================================================ 失败分组视图
+
+class TestFailureGroups(unittest.TestCase):
+    def test_no_failures_returns_empty_list(self):
+        result = verify_batch(
+            {"batch_id": "B", "proofs": [proof("p1"), proof("p2")]},
+            StubVerifier(),
+        )
+        self.assertEqual(result.failure_groups(), [])
+
+    def test_single_group_fallback_failures(self):
+        # 同组：p2 被拒（rejected）、p3 验证异常（verify_error）
+        v = StubVerifier(agg_verify=False, reject_ids={"p2"}, error_ids={"p3"})
+        result = verify_batch(
+            {"batch_id": "B", "proofs": [proof("p1"), proof("p2"), proof("p3")]},
+            v,
+        )
+        groups = result.failure_groups()
+        self.assertEqual(len(groups), 1)
+        summary = groups[0]
+        self.assertEqual(set(summary),
+                         {"group_id", "failed_proof_ids", "failed_count", "failures"})
+        self.assertEqual(summary["group_id"], "groth16:c1:k1")
+        self.assertEqual(summary["failed_proof_ids"], ["p2", "p3"])
+        self.assertEqual(summary["failed_count"], 2)
+        details = summary["failures"]
+        self.assertEqual([d["proof_id"] for d in details], ["p2", "p3"])
+        self.assertEqual(details[0]["code"], "rejected")
+        self.assertEqual(details[0]["stage"], "single_verify")
+        self.assertEqual(details[0]["message"], "proof rejected by verifier")
+        self.assertEqual(details[1]["code"], "verify_error")
+        self.assertEqual(details[1]["stage"], "single_verify")
+        self.assertIn("bad proof bytes", details[1]["message"])
+        # 明细固定四键，group_id 不重复出现
+        self.assertEqual(
+            {k for d in details for k in d},
+            {"proof_id", "stage", "code", "message"},
+        )
+
+    def test_groups_sorted_by_group_id_and_inner_by_proof_id(self):
+        # 两个 aggregation_key：组 k2 的证明在批次中先出现，
+        # 摘要仍须按 group_id 升序（k1 在 k2 前）。
+        v = StubVerifier(agg_verify=False, reject_ids={"z1", "a2", "m2"})
+        result = verify_batch(
+            {
+                "batch_id": "B",
+                "proofs": [
+                    proof("z1", key="k2"),
+                    proof("a2", key="k1"),
+                    proof("m2", key="k1"),
+                ],
+            },
+            v,
+        )
+        groups = result.failure_groups()
+        self.assertEqual([g["group_id"] for g in groups],
+                         ["groth16:c1:k1", "groth16:c1:k2"])
+        self.assertEqual(groups[0]["failed_proof_ids"], ["a2", "m2"])
+        self.assertEqual(
+            [d["proof_id"] for d in groups[0]["failures"]], ["a2", "m2"]
+        )
+        self.assertEqual(groups[1]["failed_proof_ids"], ["z1"])
+
+    def test_rejected_and_verify_error_both_kept(self):
+        v = StubVerifier(agg_verify=False, reject_ids={"p1"}, error_ids={"p2"})
+        result = verify_batch(
+            {"batch_id": "B", "proofs": [proof("p1"), proof("p2")]}, v
+        )
+        details = result.failure_groups()[0]["failures"]
+        codes = {(d["proof_id"], d["code"]) for d in details}
+        self.assertEqual(codes, {("p1", "rejected"), ("p2", "verify_error")})
+
+    def test_mixed_stage_kinds_distinguished_across_groups(self):
+        # 组 k1：聚合阶段异常（stage=aggregate）；
+        # 组 k2：单证全部通过但聚合验证被拒（stage=aggregate_verify）；
+        # 组 k3：回退单证验证失败（stage=single_verify）。
+        class StageVerifier(StubVerifier):
+            def aggregate(self, proofs):
+                if proofs[0].aggregation_key == "k1":
+                    raise RuntimeError("aggregator down")
+                return super().aggregate(proofs)
+
+            def verify_aggregate(self, proofs, aggregated):
+                return proofs[0].aggregation_key not in ("k2", "k3")
+
+            def verify(self, p):
+                return p.aggregation_key != "k3" or p.proof_id != "p3"
+
+        result = verify_batch(
+            {
+                "batch_id": "B",
+                "proofs": [
+                    proof("p1", key="k1"),
+                    proof("p2", key="k2"),
+                    proof("p3", key="k3"),
+                ],
+            },
+            StageVerifier(),
+        )
+        groups = {g["group_id"]: g for g in result.failure_groups()}
+        self.assertEqual(len(groups), 3)
+        g1 = groups["groth16:c1:k1"]
+        self.assertEqual(g1["failed_proof_ids"], ["p1"])
+        self.assertEqual(g1["failures"][0]["stage"], "aggregate")
+        self.assertEqual(g1["failures"][0]["code"], "verify_error")
+        self.assertIn("aggregator down", g1["failures"][0]["message"])
+        g2 = groups["groth16:c1:k2"]
+        self.assertEqual(g2["failed_proof_ids"], ["p2"])
+        self.assertEqual(g2["failures"][0]["stage"], "aggregate_verify")
+        self.assertEqual(g2["failures"][0]["code"], "rejected")
+        g3 = groups["groth16:c1:k3"]
+        self.assertEqual(g3["failed_proof_ids"], ["p3"])
+        self.assertEqual(g3["failures"][0]["stage"], "single_verify")
+        self.assertEqual(g3["failures"][0]["code"], "rejected")
+
+    def test_messages_not_rewritten_or_merged(self):
+        v = StubVerifier(agg_verify=False, error_ids={"p1", "p2"})
+        result = verify_batch(
+            {"batch_id": "B", "proofs": [proof("p1"), proof("p2")]}, v
+        )
+        details = result.failure_groups()[0]["failures"]
+        # 两条 verify_error 各自保留独立明细，不合并
+        self.assertEqual(len(details), 2)
+        self.assertTrue(all("ValueError: bad proof bytes" == d["message"]
+                            for d in details))
+        self.assertEqual([d["proof_id"] for d in details], ["p1", "p2"])
+
+    def test_repeated_calls_stable_and_equal(self):
+        v = StubVerifier(agg_verify=False, reject_ids={"z", "a"}, error_ids={"m"})
+        result = verify_batch(
+            {"batch_id": "B",
+             "proofs": [proof("z", key="k2"), proof("a", key="k1"),
+                        proof("m", key="k1")]},
+            v,
+        )
+        first = result.failure_groups()
+        second = result.failure_groups()
+        self.assertEqual(first, second)
+
+    def test_view_does_not_change_result_or_to_dict(self):
+        v = StubVerifier(agg_verify=False, reject_ids={"p2"}, error_ids={"p3"})
+        result = verify_batch(
+            {"batch_id": "B", "proofs": [proof("p1"), proof("p2"), proof("p3")]},
+            v,
+        )
+        before = result.to_dict()
+        result.failure_groups()
+        after = result.to_dict()
+        self.assertEqual(before, after)
+        self.assertEqual(set(after),
+                         {"batch_id", "aggregate_count", "passed", "failed",
+                          "failures"})
+        self.assertEqual(
+            {k for k in after["failures"][0]},
+            {"proof_id", "group_id", "stage", "code", "message"},
+        )
+        # 视图与 failures 的归属一致：不增删记录
+        groups = result.failure_groups()
+        self.assertEqual(
+            sum(len(g["failures"]) for g in groups), len(result.failures)
+        )
+        self.assertEqual(
+            sum(g["failed_count"] for g in groups), result.failed
+        )
+
+    def test_all_failed_deterministic(self):
+        v = StubVerifier(agg_verify=False, reject_ids={"p1", "p2", "p3"})
+        result = verify_batch(
+            {"batch_id": "B", "proofs": [proof("p3"), proof("p1"), proof("p2")]},
+            v,
+        )
+        groups = result.failure_groups()
+        self.assertEqual(groups[0]["failed_proof_ids"], ["p1", "p2", "p3"])
+        self.assertEqual(groups[0]["failed_count"], 3)
+
+
 # ================================================================ 队列
 
 class TestQueue(unittest.TestCase):
