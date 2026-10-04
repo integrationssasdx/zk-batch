@@ -22,7 +22,8 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import Any, Dict, Iterable, List, Tuple
+from dataclasses import dataclass
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from .errors import (
     DuplicateProofIdError,
@@ -33,15 +34,28 @@ from .errors import (
     VerifierContractError,
 )
 from .models import (
+    AGG_CALL_ERROR,
+    AGG_CALL_SUCCEEDED,
+    AGG_VERIFY_ERROR,
+    AGG_VERIFY_NOT_RUN,
+    AGG_VERIFY_PASSED,
+    AGG_VERIFY_REJECTED,
     CODE_REJECTED,
     CODE_VERIFY_ERROR,
+    SINGLE_NOT_RUN,
+    SINGLE_PASSED,
+    SINGLE_REJECTED,
+    SINGLE_ERROR,
     STAGE_AGGREGATE,
     STAGE_AGGREGATE_VERIFY,
     STAGE_SINGLE_VERIFY,
+    BatchVerificationReport,
     BatchVerificationResult,
     Failure,
     GroupKey,
+    GroupVerificationReport,
     Proof,
+    ProofVerificationDetail,
 )
 from .verifier import ZKVerifier
 
@@ -62,7 +76,30 @@ def verify_batch(batch: Any, verifiers: Any) -> BatchVerificationResult:
     ``batch`` 为含 ``batch_id`` 与 ``proofs`` 的映射；``verifiers`` 为
     :class:`ZKVerifier` 实例（单个、列表/元组）或 ``{protocol: verifier}`` 字典。
     """
+    return _run_pipeline(batch, verifiers).result
 
+
+def verify_batch_detailed(batch: Any, verifiers: Any) -> BatchVerificationReport:
+    """验证一个批次并返回 :class:`BatchVerificationReport`。
+
+    与 :func:`verify_batch` 走完全相同的校验与分组流水线：空批次、字段缺失
+    或类型错误、重复 ``proof_id``、未知 protocol、验证器契约违约、
+    :class:`IncompatibleAggregationError`（不能聚合）在两个入口抛出的异常
+    类型与优先级完全一致；其中不能聚合时异常仍向调用方传播，不返回报告。
+    报告中的 ``result`` 与 :func:`verify_batch` 的返回值同值。
+    """
+    return _run_pipeline(batch, verifiers).report
+
+
+@dataclass
+class _PipelineOutput:
+    """一次流水线的内部产物：普通结果与其同值的详细报告。"""
+
+    result: BatchVerificationResult
+    report: BatchVerificationReport
+
+
+def _run_pipeline(batch: Any, verifiers: Any) -> _PipelineOutput:
     batch_id, raw_proofs = _validate_batch(batch)
     proofs = _normalize_proofs(raw_proofs)
     _ensure_unique_ids(proofs)
@@ -71,23 +108,32 @@ def verify_batch(batch: Any, verifiers: Any) -> BatchVerificationResult:
     protocol_map = _resolve_verifiers(verifiers)
 
     failures: List[Failure] = []
+    group_reports: List[GroupVerificationReport] = []
     for key, members in groups:
         # 逐组流水线。跨组的异常出现顺序与需求清单一致：
         # 不能聚合(前一组) -> 未知系统(后一组) -> 契约违约（调用点惰性暴露）。
         verifier = protocol_map.get(key[0])
         if verifier is None:
             raise UnsupportedProofSystemError(key[0])
-        failures.extend(_verify_group(key, members, verifier))
+        group_failures, group_report = _verify_group(key, members, verifier)
+        failures.extend(group_failures)
+        group_reports.append(group_report)
 
+    # failures 按 proof_id 排序是对外结果契约；分组报告内保持批次原序，
+    # 二者互不影响。
     failures.sort(key=lambda f: f.proof_id)
     total = len(proofs)
     failed = len(failures)
-    return BatchVerificationResult(
+    result = BatchVerificationResult(
         batch_id=batch_id,
         aggregate_count=len(groups),
         passed=total - failed,
         failed=failed,
         failures=failures,
+    )
+    return _PipelineOutput(
+        result=result,
+        report=BatchVerificationReport(result=result, groups=group_reports),
     )
 
 
@@ -237,8 +283,9 @@ def _require_bool(value: Any, verifier: ZKVerifier, what: str) -> bool:
 
 def _verify_group(
     key: GroupKey, members: List[Proof], verifier: ZKVerifier
-) -> List[Failure]:
+) -> Tuple[List[Failure], GroupVerificationReport]:
     group_id = f"{key[0]}:{key[1]}:{key[2]}"
+    proof_ids = [proof.proof_id for proof in members]
 
     # ---- 聚合 -----------------------------------------------------------
     # 惰性契约检查：缺 aggregate 是 VerifierContractError，不进入归责流程。
@@ -248,9 +295,26 @@ def _verify_group(
     except IncompatibleAggregationError:
         raise
     except Exception as exc:  # noqa: BLE001 - 归责到组内每证，不炸整批
-        return _group_wide_failures(
-            members, STAGE_AGGREGATE, CODE_VERIFY_ERROR, _exc_message(exc)
+        message = _exc_message(exc)
+        failures = _group_wide_failures(
+            members, STAGE_AGGREGATE, CODE_VERIFY_ERROR, message
         )
+        report = GroupVerificationReport(
+            group_id=group_id,
+            proof_ids=proof_ids,
+            aggregate_call_status=AGG_CALL_ERROR,
+            aggregate_verify_status=AGG_VERIFY_NOT_RUN,
+            fell_back=False,
+            proofs=[
+                ProofVerificationDetail(
+                    proof_id=proof.proof_id,
+                    status=SINGLE_NOT_RUN,
+                    message=message,
+                )
+                for proof in members
+            ],
+        )
+        return failures, report
 
     # ---- 整组验证 -------------------------------------------------------
     _require_method(verifier, "verify_aggregate")
@@ -260,7 +324,7 @@ def _verify_group(
             verifier,
             "verify_aggregate",
         )
-        aggregate_error: Exception = None  # type: ignore[assignment]
+        aggregate_error: Optional[Exception] = None
     except VerifierContractError:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -268,29 +332,61 @@ def _verify_group(
         aggregate_error = exc
 
     if ok:
-        return []
+        report = GroupVerificationReport(
+            group_id=group_id,
+            proof_ids=proof_ids,
+            aggregate_call_status=AGG_CALL_SUCCEEDED,
+            aggregate_verify_status=AGG_VERIFY_PASSED,
+            fell_back=False,
+            proofs=[
+                ProofVerificationDetail(
+                    proof_id=proof.proof_id,
+                    status=SINGLE_PASSED,
+                    message="",
+                )
+                for proof in members
+            ],
+        )
+        return [], report
 
     # ---- 回退：按批次原序逐证验证 ---------------------------------------
     # 进入回退才需要 verify；缺方法按 VerifierContractError 直接抛出。
     _require_method(verifier, "verify")
     failures: List[Failure] = []
+    details: List[ProofVerificationDetail] = []
     for proof in members:
         try:
             single_ok = _require_bool(verifier.verify(proof), verifier, "verify")
         except VerifierContractError:
             raise
         except Exception as exc:  # noqa: BLE001
+            message = _exc_message(exc)
             failures.append(
                 Failure(
                     proof_id=proof.proof_id,
                     group_id=group_id,
                     stage=STAGE_SINGLE_VERIFY,
                     code=CODE_VERIFY_ERROR,
-                    message=_exc_message(exc),
+                    message=message,
+                )
+            )
+            details.append(
+                ProofVerificationDetail(
+                    proof_id=proof.proof_id,
+                    status=SINGLE_ERROR,
+                    message=message,
                 )
             )
             continue
-        if not single_ok:
+        if single_ok:
+            details.append(
+                ProofVerificationDetail(
+                    proof_id=proof.proof_id,
+                    status=SINGLE_PASSED,
+                    message="",
+                )
+            )
+        else:
             failures.append(
                 Failure(
                     proof_id=proof.proof_id,
@@ -300,24 +396,56 @@ def _verify_group(
                     message="proof rejected by verifier",
                 )
             )
+            details.append(
+                ProofVerificationDetail(
+                    proof_id=proof.proof_id,
+                    status=SINGLE_REJECTED,
+                    message="proof rejected by verifier",
+                )
+            )
 
     if failures:
-        return failures
+        # 回退后存在被拒/异常的单证
+        report = GroupVerificationReport(
+            group_id=group_id,
+            proof_ids=proof_ids,
+            aggregate_call_status=AGG_CALL_SUCCEEDED,
+            aggregate_verify_status=(
+                AGG_VERIFY_ERROR if aggregate_error is not None
+                else AGG_VERIFY_REJECTED
+            ),
+            fell_back=True,
+            proofs=details,
+        )
+        return failures, report
 
-    # 单证全部通过但整组失败：归责到聚合阶段
+    # 单证全部通过但整组失败：归责到聚合阶段。逐证状态仍为 passed；
+    # failures 的归责消息来自聚合阶段（异常或被拒），不与逐证消息混用。
     if aggregate_error is not None:
-        return _group_wide_failures(
+        failures = _group_wide_failures(
             members,
             STAGE_AGGREGATE_VERIFY,
             CODE_VERIFY_ERROR,
             _exc_message(aggregate_error),
         )
-    return _group_wide_failures(
-        members,
-        STAGE_AGGREGATE_VERIFY,
-        CODE_REJECTED,
-        "aggregate verification rejected the group but all single proofs passed",
+        verify_status = AGG_VERIFY_ERROR
+    else:
+        failures = _group_wide_failures(
+            members,
+            STAGE_AGGREGATE_VERIFY,
+            CODE_REJECTED,
+            "aggregate verification rejected the group but all single proofs passed",
+        )
+        verify_status = AGG_VERIFY_REJECTED
+    report = GroupVerificationReport(
+        group_id=group_id,
+        proof_ids=proof_ids,
+        aggregate_call_status=AGG_CALL_SUCCEEDED,
+        aggregate_verify_status=verify_status,
+        fell_back=True,
+        proofs=details,
     )
+    return failures, report
 
 
 def _group_wide_failures(

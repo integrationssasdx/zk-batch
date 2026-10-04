@@ -138,6 +138,81 @@ class BatchVerificationResult:
         return summaries
 
 
+# 详细报告：聚合调用 / 聚合验证 / 回退单证验证状态
+AGG_CALL_SUCCEEDED = "succeeded"   # aggregate 正常返回
+AGG_CALL_ERROR = "error"           # aggregate 抛出 IncompatibleAggregationError 之外的异常
+AGG_VERIFY_PASSED = "passed"       # verify_aggregate 返回 True
+AGG_VERIFY_REJECTED = "rejected"   # verify_aggregate 返回 False
+AGG_VERIFY_ERROR = "error"         # verify_aggregate 抛异常
+AGG_VERIFY_NOT_RUN = "not_run"     # aggregate 调用失败，未进入聚合验证
+SINGLE_NOT_RUN = "not_run"         # 未进入回退（聚合调用即失败）
+SINGLE_PASSED = "passed"
+SINGLE_REJECTED = "rejected"
+SINGLE_ERROR = "error"
+
+
+@dataclass(frozen=True)
+class ProofVerificationDetail:
+    """回退阶段单条证明的状态与消息。
+
+    未回退（聚合调用即失败）时 ``status`` 为 ``not_run``；``message`` 只
+    承载状态文本或 ``异常类型名: str(exc)``，绝不包含 proof 与
+    public_inputs 内容。
+    """
+
+    proof_id: str
+    status: str
+    message: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "proof_id": self.proof_id,
+            "status": self.status,
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
+class GroupVerificationReport:
+    """单个聚合组的详细报告；组内明细按批次原序。"""
+
+    group_id: str
+    proof_ids: List[str]
+    aggregate_call_status: str
+    aggregate_verify_status: str
+    fell_back: bool
+    proofs: List[ProofVerificationDetail]
+
+    def to_dict(self) -> dict:
+        return {
+            "group_id": self.group_id,
+            "proof_ids": list(self.proof_ids),
+            "aggregate_call_status": self.aggregate_call_status,
+            "aggregate_verify_status": self.aggregate_verify_status,
+            "fell_back": self.fell_back,
+            "proofs": [p.to_dict() for p in self.proofs],
+        }
+
+
+@dataclass(frozen=True)
+class BatchVerificationReport:
+    """整批详细报告。
+
+    ``result`` 与 :func:`verify_batch` 返回的 :class:`BatchVerificationResult`
+    同值（相同输入下字段完全一致）；``groups`` 按分组首次出现顺序排列，
+    组内证明保持批次原序。
+    """
+
+    result: BatchVerificationResult
+    groups: List[GroupVerificationReport]
+
+    def to_dict(self) -> dict:
+        return {
+            "result": self.result.to_dict(),
+            "groups": [g.to_dict() for g in self.groups],
+        }
+
+
 @dataclass
 class VerificationJob:
     """队列中的一个验证作业。"""
