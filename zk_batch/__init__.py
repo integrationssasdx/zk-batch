@@ -5,7 +5,8 @@
 * :func:`verify_batch` —— 按分组键聚合验证，失败回退单证验证。
 * :func:`verify_batch_detailed` —— 同流水线的详细报告入口，
   返回 :class:`BatchVerificationReport`。
-* :class:`VerificationQueue` —— 分组聚合的串行作业队列。
+* :class:`VerificationQueue` —— 分组聚合的串行作业队列，含失败复核
+  （``reverify_failures``）与只读复核对账（``reverify_outcome``）。
 * :class:`VerificationTaskQueue` —— 可排队、可定位失败原因的逐项验证队列。
 * :class:`ZKVerifier` —— 用户实现具体证明系统时继承的契约基类。
 """
@@ -24,6 +25,7 @@ from .errors import (
     NoFailedProofError,
     NoRetryableItemsError,
     ResultUnavailableError,
+    ReverifyLineageMismatchError,
     RunningJobError,
     TaskLineageMismatchError,
     TaskNotFoundError,
@@ -46,6 +48,8 @@ from .models import (
     ProofVerificationDetail,
     RetryOutcomeItem,
     RetryOutcomeReport,
+    ReverifyOutcomeItem,
+    ReverifyOutcomeReport,
     TaskProgress,
     TaskRetrySubmission,
     TaskSubmission,
@@ -77,6 +81,8 @@ __all__ = [
     "TaskProgress",
     "RetryOutcomeItem",
     "RetryOutcomeReport",
+    "ReverifyOutcomeItem",
+    "ReverifyOutcomeReport",
     "MAX_BATCH_ITEMS",
     "EmptyBatchError",
     "InvalidProofError",
@@ -91,6 +97,7 @@ __all__ = [
     "ResultUnavailableError",
     "NoFailedProofError",
     "NoRetryableItemsError",
+    "ReverifyLineageMismatchError",
     "DuplicateItemIdError",
     "InvalidItemIdError",
     "BatchSizeLimitError",

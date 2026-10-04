@@ -382,6 +382,80 @@ class TaskProgress:
         }
 
 
+# ============================================================ 分组复核对账
+
+# 对账结论（仅两种；before_status 固定 failed）
+REVERIFY_RECOVERED = "recovered"          # 复核后通过
+REVERIFY_STILL_FAILED = "still_failed"    # 复核后仍失败
+
+
+@dataclass(frozen=True)
+class ReverifyOutcomeItem:
+    """单个失败证明的复核对账明细（分组聚合队列）。
+
+    对账范围严格沿用 ``reverify_failures`` 的选取；明细按源批次原序排列。
+    ``before_status`` 固定为 ``failed``，``before_*`` 定位取自源作业的
+    失败记录；``after_status`` 只取 ``passed``/``failed``——恢复项为
+    ``passed`` 且定位为空串，失败项为 ``failed`` 且定位取自复核作业的
+    :class:`Failure`。``outcome`` 为该证明唯一结论（``recovered`` /
+    ``still_failed``）。只承载定位信息，不含 proof、public_inputs、
+    调用栈或未公开验证器信息。
+    """
+
+    proof_id: str
+    before_status: str
+    before_stage: str
+    before_code: str
+    before_message: str
+    after_status: str
+    after_stage: str
+    after_code: str
+    after_message: str
+    outcome: str
+
+    def to_dict(self) -> dict:
+        return {
+            "proof_id": self.proof_id,
+            "outcome": self.outcome,
+            "before_status": self.before_status,
+            "before_stage": self.before_stage,
+            "before_code": self.before_code,
+            "before_message": self.before_message,
+            "after_status": self.after_status,
+            "after_stage": self.after_stage,
+            "after_code": self.after_code,
+            "after_message": self.after_message,
+        }
+
+
+@dataclass(frozen=True)
+class ReverifyOutcomeReport:
+    """``reverify_failures`` 复核结果的只读对账报告。
+
+    ``selected_proof_ids`` 与 ``items`` 均按源批次原序排列；
+    ``recovered_proof_ids``/``still_failed_proof_ids`` 按结论归类、各自
+    保持源批次原序。只承载定位信息，不含 proof、public_inputs、调用栈或
+    未公开验证器信息。
+    """
+
+    source_job_id: str
+    retry_job_id: str
+    selected_proof_ids: List[str]
+    items: List[ReverifyOutcomeItem]
+    recovered_proof_ids: List[str]
+    still_failed_proof_ids: List[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "source_job_id": self.source_job_id,
+            "retry_job_id": self.retry_job_id,
+            "selected_proof_ids": list(self.selected_proof_ids),
+            "items": [item.to_dict() for item in self.items],
+            "recovered_proof_ids": list(self.recovered_proof_ids),
+            "still_failed_proof_ids": list(self.still_failed_proof_ids),
+        }
+
+
 # ============================================================ 复核对账
 
 # 对账前后可能出现的结果之外的状态：入选项在该次验证中尚无结果
