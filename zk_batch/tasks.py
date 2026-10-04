@@ -17,6 +17,9 @@
 * :meth:`run_next` 同步消费最早的 queued 任务；:meth:`run_task` 消费指定
   任务。任务仅会被消费一次：处理中重复消费、终态后再次入队/消费均抛
   :class:`TaskStateConflictError`。
+* :meth:`retry_failed` 从 completed/failed 源任务挑选待复核项，按根任务
+  输入顺序创建独立的 queued 任务；新任务沿用同样的执行、进度、结果与错误
+  查询，不修改源任务。
 * 处理过程中 :meth:`progress` 返回真实完成进度（``completed`` 为已结束
   项数），未结束时 ``result`` 为 ``None``，不提前给出最终结果。
 * 系统无法读取证明材料、验证器执行失败或无法保存最终结果时抛
@@ -48,6 +51,7 @@ from .errors import (
     EmptyBatchError,
     InvalidItemIdError,
     InvalidProofFormatError,
+    NoRetryableItemsError,
     TaskNotFoundError,
     TaskStateConflictError,
     VerificationInfrastructureError,
@@ -68,11 +72,13 @@ from .models import (
     TASK_FAILED,
     TASK_PROCESSING,
     TASK_QUEUED,
+    TASK_TERMINAL_STATUSES,
     BatchSummary,
     BatchTaskResult,
     ItemResult,
     Proof,
     TaskProgress,
+    TaskRetrySubmission,
     TaskSubmission,
 )
 
@@ -94,10 +100,21 @@ class _ProofReadError(Exception):
 class _TaskRecord:
     """队列内部的任务记录（不对外暴露）。"""
 
-    def __init__(self, task_id: str, items: List[dict], verifiers: Any):
+    def __init__(
+        self,
+        task_id: str,
+        items: List[dict],
+        verifiers: Any,
+        root_indexes: Optional[List[int]] = None,
+    ):
         self.task_id = task_id
         self.items = items
         self.verifiers = verifiers
+        # 各项在根任务（最初提交）输入中的零起下标；普通提交时即自身下标，
+        # 复核任务按入选项映射，保证 ItemResult.index 始终回溯到根任务。
+        self.root_indexes = (
+            list(range(len(items))) if root_indexes is None else list(root_indexes)
+        )
         self.status: str = TASK_QUEUED
         self.total: int = len(items)
         self.results: List[ItemResult] = []
@@ -242,6 +259,66 @@ class VerificationTaskQueue:
         """
         return self._require_task(task_id).error
 
+    # --------------------------------------------------------------- 复核
+
+    def retry_failed(
+        self, task_id: str, verifiers: Any = None
+    ) -> TaskRetrySubmission:
+        """从 completed/failed 源任务挑选待复核项，创建独立的 queued 任务。
+
+        入选项按**根任务（最初提交）输入顺序**组成新任务，源任务的状态、
+        结果、错误定位与保存历史均不变；新任务只是普通任务，沿用
+        run_next/run_task/progress/result/task_error，不起线程、不联网、
+        不落盘。每次复核都生成不同的新任务标识，可对复核任务再次复核。
+
+        入选规则：
+
+        * completed：只选 ``results`` 中 ``status == failed`` 的项；
+        * failed：从 :attr:`VerificationInfrastructureError.index` 对应的
+          错误项起，纳入错误项及其后尚无结果的项，再与已有失败项合并按根
+          任务输入顺序去重；若错误无明确项下标（如 result_save 失败）且
+          结果已覆盖全部输入，则只选已有失败项。
+
+        新任务每项只验证一次，:class:`ItemResult.index` 保留根任务下标——
+        再次失败仍定位到最初提交的输入位置。``verifiers`` 只作用于新任务，
+        省略时继承源任务的选择，解析与契约异常的口径与普通执行一致。
+
+        异常（不得互相替代）：未知任务 :class:`TaskNotFoundError`；
+        queued/processing 源任务 :class:`TaskStateConflictError`；
+        没有可复核项 :class:`NoRetryableItemsError`。
+        """
+        record = self._require_task(task_id)
+        if record.status not in TASK_TERMINAL_STATUSES:
+            raise TaskStateConflictError(
+                f"task {task_id!r} cannot be retried in status "
+                f"{record.status!r}"
+            )
+
+        positions = self._retryable_positions(record)
+        if not positions:
+            raise NoRetryableItemsError(
+                f"task {task_id!r} has no retryable items "
+                f"(status={record.status!r})"
+            )
+
+        items = [record.items[pos] for pos in positions]
+        root_indexes = [record.root_indexes[pos] for pos in positions]
+        chosen = verifiers if verifiers is not None else record.verifiers
+        new_task_id = f"task-{next(self._counter)}"
+        self._tasks[new_task_id] = _TaskRecord(
+            new_task_id, items, chosen, root_indexes=root_indexes
+        )
+        return TaskRetrySubmission(
+            source_task_id=task_id,
+            task_id=new_task_id,
+            status=TASK_QUEUED,
+            summary=BatchSummary(
+                total=len(items),
+                item_ids=[item["item_id"] for item in items],
+            ),
+            retried_indexes=root_indexes,
+        )
+
     # --------------------------------------------------------------- 内部
 
     def _consume(self, task_id: str) -> BatchTaskResult:
@@ -279,6 +356,8 @@ class VerificationTaskQueue:
             )
 
         for index, item in enumerate(record.items):
+            # 定位下标始终回溯到根任务（最初提交）输入，复核链上也不重置。
+            root_index = record.root_indexes[index]
             item_id = item["item_id"]
             material = item["proof"]
 
@@ -287,7 +366,7 @@ class VerificationTaskQueue:
                 proof = _read_proof(material)
             except _ProofReadError as exc:
                 raise VerificationInfrastructureError(
-                    index=index,
+                    index=root_index,
                     item_id=item_id,
                     stage=ITEM_STAGE_PROOF_READ,
                     code=ITEM_CODE_INVALID_PROOF,
@@ -298,7 +377,7 @@ class VerificationTaskQueue:
             verifier = protocol_map.get(proof.protocol)
             if verifier is None:
                 raise VerificationInfrastructureError(
-                    index=index,
+                    index=root_index,
                     item_id=item_id,
                     stage=ITEM_STAGE_VERIFY,
                     code=ITEM_CODE_VERIFIER_UNAVAILABLE,
@@ -313,7 +392,7 @@ class VerificationTaskQueue:
                 ok = _require_bool(verifier.verify(proof), verifier, "verify")
             except VerifierContractError as exc:
                 raise VerificationInfrastructureError(
-                    index=index,
+                    index=root_index,
                     item_id=item_id,
                     stage=ITEM_STAGE_VERIFY,
                     code=ITEM_CODE_VERIFIER_FAULT,
@@ -321,7 +400,7 @@ class VerificationTaskQueue:
                 )
             except Exception as exc:  # noqa: BLE001 - 验证器执行失败
                 raise VerificationInfrastructureError(
-                    index=index,
+                    index=root_index,
                     item_id=item_id,
                     stage=ITEM_STAGE_VERIFY,
                     code=ITEM_CODE_VERIFIER_FAULT,
@@ -332,7 +411,7 @@ class VerificationTaskQueue:
             if ok:
                 record.results.append(
                     ItemResult(
-                        index=index,
+                        index=root_index,
                         item_id=item_id,
                         status=ITEM_PASSED,
                     )
@@ -340,7 +419,7 @@ class VerificationTaskQueue:
             else:
                 record.results.append(
                     ItemResult(
-                        index=index,
+                        index=root_index,
                         item_id=item_id,
                         status=ITEM_FAILED,
                         stage=ITEM_STAGE_VERIFY,
@@ -366,6 +445,37 @@ class VerificationTaskQueue:
             )
             record.status = TASK_FAILED
             raise record.error
+
+    @staticmethod
+    def _retryable_positions(record: _TaskRecord) -> List[int]:
+        """计算待复核项在该任务自身 ``items`` 中的位置，按根任务顺序去重。
+
+        选择在**根任务下标空间**判定（复核任务的 ``root_indexes`` 把本地
+        位置映射回根下标，普通提交时二者相同）：completed 只选已有失败项；
+        failed 额外纳入错误项下标起、尚无结果的错误项及其后项。结果天然按
+        根任务输入顺序排列，已通过项不会被选中。
+        """
+        failed_roots = {
+            result.index
+            for result in record.results
+            if result.status == ITEM_FAILED
+        }
+        present_roots = {result.index for result in record.results}
+        error_root: Optional[int] = None
+        if record.status == TASK_FAILED and record.error is not None:
+            error_root = record.error.index
+
+        positions: List[int] = []
+        for pos, root_index in enumerate(record.root_indexes):
+            if root_index in failed_roots:
+                positions.append(pos)
+            elif (
+                isinstance(error_root, int)
+                and root_index >= error_root
+                and root_index not in present_roots
+            ):
+                positions.append(pos)
+        return positions
 
     @staticmethod
     def _build_result(record: _TaskRecord) -> BatchTaskResult:

@@ -22,6 +22,7 @@ from .errors import (
     InvalidProofError,
     InvalidProofFormatError,
     NoFailedProofError,
+    NoRetryableItemsError,
     ResultUnavailableError,
     RunningJobError,
     TaskNotFoundError,
@@ -43,6 +44,7 @@ from .models import (
     Proof,
     ProofVerificationDetail,
     TaskProgress,
+    TaskRetrySubmission,
     TaskSubmission,
     VerificationJob,
 )
@@ -68,6 +70,7 @@ __all__ = [
     "BatchTaskResult",
     "BatchSummary",
     "TaskSubmission",
+    "TaskRetrySubmission",
     "TaskProgress",
     "MAX_BATCH_ITEMS",
     "EmptyBatchError",
@@ -88,5 +91,6 @@ __all__ = [
     "InvalidProofFormatError",
     "TaskNotFoundError",
     "TaskStateConflictError",
+    "NoRetryableItemsError",
     "VerificationInfrastructureError",
 ]

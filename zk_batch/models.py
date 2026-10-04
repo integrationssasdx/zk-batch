@@ -310,6 +310,33 @@ class TaskSubmission:
 
 
 @dataclass(frozen=True)
+class TaskRetrySubmission:
+    """复核提交成功的回执。
+
+    复核从 completed/failed 源任务挑选待复核项，组成独立的 queued 任务：
+    ``source_task_id`` 为源任务标识，``task_id`` 为新任务标识，``status``
+    固定为 ``queued``，``summary`` 仅描述入选项（``total``/``item_ids``），
+    ``retried_indexes`` 为入选项在**源（根）任务输入**中的零起下标，顺序与
+    入选项一致。不含任何证明材料。
+    """
+
+    source_task_id: str
+    task_id: str
+    status: str
+    summary: BatchSummary
+    retried_indexes: List[int]
+
+    def to_dict(self) -> dict:
+        return {
+            "source_task_id": self.source_task_id,
+            "task_id": self.task_id,
+            "status": self.status,
+            "summary": self.summary.to_dict(),
+            "retried_indexes": list(self.retried_indexes),
+        }
+
+
+@dataclass(frozen=True)
 class BatchTaskResult:
     """整批逐项验证的聚合结果。
 

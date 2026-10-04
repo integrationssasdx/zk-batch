@@ -121,6 +121,14 @@ class TaskStateConflictError(TaskError):
     """重复消费、终态后再次入队或任务状态互相冲突。"""
 
 
+class NoRetryableItemsError(TaskError):
+    """completed/failed 源任务中没有任何可复核项。
+
+    completed 源任务的结果里没有失败项，或 failed 源任务的错误项、其后
+    未完成项与已有失败项的并集为空时抛出；不得用其他异常替代。
+    """
+
+
 class VerificationInfrastructureError(TaskError):
     """基础设施失败：无法读取证明材料、验证器执行失败或无法保存最终结果。
 
