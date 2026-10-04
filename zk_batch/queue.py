@@ -13,6 +13,9 @@
   UnknownJobError；
 * :meth:`result` 仅 completed 返回 BatchVerificationResult，其余状态抛
   ResultUnavailableError（不存在抛 UnknownJobError）。
+* :meth:`report` 仅 completed 返回与 result 同一次执行产出的
+  BatchVerificationReport（分组/逐证明细），状态异常约定与 result 相同；
+  查询不再次调用验证器，也不改变作业状态。
 * :meth:`reverify_failures` 以已完成作业的失败清单为输入，只挑出原批次中
   失败的证明（保持相对顺序、batch_id 不变）创建新的 queued 作业。源作业
   不存在抛 UnknownJobError；非 completed 抛 ResultUnavailableError；
@@ -27,7 +30,7 @@ import itertools
 from collections import OrderedDict
 from typing import Any, Dict, Optional
 
-from .engine import verify_batch
+from .engine import verify_batch_detailed
 from .errors import (
     CancelledJobError,
     CompletedJobError,
@@ -36,7 +39,11 @@ from .errors import (
     RunningJobError,
     UnknownJobError,
 )
-from .models import BatchVerificationResult, VerificationJob
+from .models import (
+    BatchVerificationReport,
+    BatchVerificationResult,
+    VerificationJob,
+)
 
 STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
@@ -53,6 +60,8 @@ class VerificationQueue:
         self._jobs: "OrderedDict[str, VerificationJob]" = OrderedDict()
         # 每个作业的验证器覆盖；VerificationJob 不新增字段以免污染公开模型
         self._verifiers: Dict[str, Any] = {}
+        # 每个已完成作业的详细报告（与 result 同一次执行产出）
+        self._reports: Dict[str, BatchVerificationReport] = {}
         self._counter = itertools.count(1)
 
     # ------------------------------------------------------------ 入队/执行
@@ -88,14 +97,16 @@ class VerificationQueue:
         job.status = STATUS_RUNNING
         verifiers = self._verifiers.pop(job.job_id)
         try:
-            result = verify_batch(job.batch, verifiers)
+            # 一次执行走完整详细流水线：result 与 report 同源，避免两次验证。
+            report = verify_batch_detailed(job.batch, verifiers)
         except Exception:
             # 输入/验证错误不属于四个持久状态，移除以释放调用方重试。
             self._jobs.pop(job.job_id, None)
             raise
         job.status = STATUS_COMPLETED
-        job.result = result
-        return result
+        job.result = report.result
+        self._reports[job.job_id] = report
+        return report.result
 
     def cancel(self, job_id: str) -> bool:
         """取消 queued 作业并返回 ``True``；其余状态按异常约定抛出。"""
@@ -128,6 +139,22 @@ class VerificationQueue:
             )
         return job.result  # type: ignore[return-value]
 
+    def report(self, job_id: str) -> BatchVerificationReport:
+        """仅 completed 作业可取详细报告。
+
+        返回的 :class:`BatchVerificationReport` 与 :meth:`result` 来自同一次
+        执行（``report(job_id).result`` 与 ``result(job_id)`` 同值）；查询
+        不再次调用验证器，也不改变作业状态。状态异常约定与 :meth:`result`
+        一致：不存在抛 UnknownJobError，queued/running/cancelled 抛
+        ResultUnavailableError。
+        """
+        job = self._require_job(job_id)
+        if job.status != STATUS_COMPLETED:
+            raise ResultUnavailableError(
+                f"job {job_id!r} has no report (status={job.status!r})"
+            )
+        return self._reports[job_id]
+
     # ---------------------------------------------------------------- 复核
 
     def reverify_failures(self, job_id: str, verifiers: Any = None) -> str:
@@ -139,8 +166,8 @@ class VerificationQueue:
         不重提整批，源作业状态与结果保持不变。
 
         ``verifiers`` 只作用于新作业，省略时使用队列默认验证器。新作业沿用
-        run_next/cancel/status/result；执行时仍走 verify_batch 的完整校验与
-        分组流水线。
+        run_next/cancel/status/result/report；执行时仍走 verify_batch_detailed
+        的完整校验与分组流水线。
 
         * 源作业不存在 ——UnknownJobError；
         * 存在但非 completed ——ResultUnavailableError；
