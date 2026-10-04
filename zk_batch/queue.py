@@ -19,9 +19,14 @@
   验证器，也不改变作业状态。其余状态/不存在的异常约定与 :meth:`result`
   相同。
 * :meth:`reverify_failures` 以已完成作业的失败清单为输入，只挑出原批次中
-  失败的证明（保持相对顺序、batch_id 不变）创建新的 queued 作业。源作业
-  不存在抛 UnknownJobError；非 completed 抛 ResultUnavailableError；
-  completed 但无失败证明抛 NoFailedProofError。
+  失败的证明（保持相对顺序、batch_id 不变）创建新的 queued 作业，并记录
+  父子关系（复核作业 -> 源作业）；重复复核得到不同 job_id，父子关系互不
+  覆盖。源作业不存在抛 UnknownJobError；非 completed 抛
+  ResultUnavailableError；completed 但无失败证明抛 NoFailedProofError。
+* :meth:`reverify_outcome` 只读对账复核结果：比对源作业与其直接复核作业
+  的结果，按源批次原序给出每个入选证明复核前后的定位与唯一结论
+  （recovered / still_failed）。不调用验证器、不创建作业、不改变任何
+  状态或结果，重复查询结果一致。
 
 不持久化、不联网、不使用线程。
 """
@@ -38,12 +43,20 @@ from .errors import (
     CompletedJobError,
     NoFailedProofError,
     ResultUnavailableError,
+    ReverifyLineageMismatchError,
     RunningJobError,
     UnknownJobError,
 )
 from .models import (
+    OUTCOME_RECOVERED,
+    OUTCOME_STILL_FAILED,
+    REVERIFY_AFTER_FAILED,
+    REVERIFY_AFTER_PASSED,
+    REVERIFY_BEFORE_STATUS,
     BatchVerificationReport,
     BatchVerificationResult,
+    ReverifyOutcomeItem,
+    ReverifyOutcomeReport,
     VerificationJob,
 )
 
@@ -64,6 +77,8 @@ class VerificationQueue:
         self._verifiers: Dict[str, Any] = {}
         # completed 作业的详细报告；与 job.result 来自同一次流水线执行
         self._reports: Dict[str, BatchVerificationReport] = {}
+        # 复核父子关系：复核作业 id -> 源作业 id；重复复核各自记录、互不覆盖
+        self._reverify_lineage: Dict[str, str] = {}
         self._counter = itertools.count(1)
 
     # ------------------------------------------------------------ 入队/执行
@@ -107,6 +122,7 @@ class VerificationQueue:
             # 输入/验证错误不属于四个持久状态，移除以释放调用方重试。
             self._jobs.pop(job.job_id, None)
             self._reports.pop(job.job_id, None)
+            self._reverify_lineage.pop(job.job_id, None)
             raise
         job.status = STATUS_COMPLETED
         job.result = report.result
@@ -172,7 +188,9 @@ class VerificationQueue:
 
         ``verifiers`` 只作用于新作业，省略时使用队列默认验证器。新作业沿用
         run_next/cancel/status/result/report；执行时同样一次走完整的详细
-        验证流水线并保存报告。
+        验证流水线并保存报告。创建时记录父子关系（新作业 -> 源作业），供
+        :meth:`reverify_outcome` 校验血缘；重复复核得到不同 job_id，父子
+        关系各自记录、互不覆盖。
 
         * 源作业不存在 ——UnknownJobError；
         * 存在但非 completed ——ResultUnavailableError；
@@ -200,7 +218,51 @@ class VerificationQueue:
             "batch_id": source_result.batch_id,
             "proofs": selected,
         }
-        return self.enqueue(sub_batch, verifiers)
+        new_job_id = self.enqueue(sub_batch, verifiers)
+        self._reverify_lineage[new_job_id] = job_id
+        return new_job_id
+
+    def reverify_outcome(
+        self, source_job_id: str, retry_job_id: str
+    ) -> ReverifyOutcomeReport:
+        """只读对账 ``reverify_failures`` 的复核结果，返回
+        :class:`ReverifyOutcomeReport`。
+
+        对账范围严格沿用 ``reverify_failures`` 的选取（即复核作业实际
+        验证的证明，按源批次原序）。每项给出复核前后定位与唯一结论：
+
+        * ``before_status`` 固定 ``failed``，``before_*`` 取源作业保存的
+          失败定位（同一 proof_id 多条记录时取首条）；
+        * ``after_*`` 取复核作业的定位——恢复项 ``after_status`` 为
+          ``passed`` 且 ``stage``/``code``/``message`` 为空，仍失败项取
+          复核 :class:`Failure` 的同名字段；
+        * ``outcome`` 只取 ``recovered`` / ``still_failed``。
+
+        本方法只读已保存的结果，不调用验证器、不创建作业、不改变任何
+        状态或结果，重复查询返回一致内容；报告只含定位信息，不含证明
+        材料、``public_inputs``、调用栈或未公开验证器信息。
+
+        * 任一作业不存在 ——UnknownJobError；
+        * 任一作业未 completed ——ResultUnavailableError；
+        * 均 completed 但 ``retry_job_id`` 不是 ``source_job_id`` 的直接
+          复核作业 ——ReverifyLineageMismatchError。
+
+        三类异常互不替代，按上述顺序依次检查。
+        """
+        source = self._require_job(source_job_id)
+        retry = self._require_job(retry_job_id)
+        for job in (source, retry):
+            if job.status != STATUS_COMPLETED:
+                raise ResultUnavailableError(
+                    f"job {job.job_id!r} has no result to reconcile "
+                    f"(status={job.status!r})"
+                )
+        if self._reverify_lineage.get(retry_job_id) != source_job_id:
+            raise ReverifyLineageMismatchError(
+                f"job {retry_job_id!r} is not a direct reverify_failures "
+                f"job of {source_job_id!r}"
+            )
+        return _build_reverify_outcome(source, retry)
 
     # ---------------------------------------------------------------- 内部
 
@@ -220,3 +282,70 @@ class VerificationQueue:
     def _job_verifiers(self, job_id: str, verifiers: Any) -> None:
         chosen = verifiers if verifiers is not None else self._default_verifiers
         self._verifiers[job_id] = chosen
+
+
+# ============================================================ 复核对账
+
+def _first_failures_by_proof(result: BatchVerificationResult) -> Dict[str, Any]:
+    """每个 proof_id 的首条失败定位（保持结果中的相对次序）。"""
+    by_proof: Dict[str, Any] = {}
+    for failure in result.failures:
+        by_proof.setdefault(failure.proof_id, failure)
+    return by_proof
+
+
+def _build_reverify_outcome(
+    source: VerificationJob, retry: VerificationJob
+) -> ReverifyOutcomeReport:
+    """比对源作业与其直接复核作业的结果，生成对账报告（纯只读）。
+
+    明细范围即复核作业实际验证的证明（其批次就是按源批次原序选出的
+    失败证明）；前后定位分别取自源作业与复核作业已保存的结果。
+    """
+    # 复核作业的批次即 reverify_failures 按源批次原序选出的失败证明。
+    selected_ids = [raw["proof_id"] for raw in retry.batch["proofs"]]
+    source_failures = _first_failures_by_proof(source.result)
+    retry_failures = _first_failures_by_proof(retry.result)
+
+    items = []
+    recovered_ids = []
+    still_failed_ids = []
+    for proof_id in selected_ids:
+        # 入选证明在源作业中必有失败定位（选取即来自源失败清单）。
+        before = source_failures[proof_id]
+        after = retry_failures.get(proof_id)
+        if after is None:
+            outcome = OUTCOME_RECOVERED
+            after_status = REVERIFY_AFTER_PASSED
+            after_stage = after_code = after_message = ""
+            recovered_ids.append(proof_id)
+        else:
+            outcome = OUTCOME_STILL_FAILED
+            after_status = REVERIFY_AFTER_FAILED
+            after_stage = after.stage
+            after_code = after.code
+            after_message = after.message
+            still_failed_ids.append(proof_id)
+        items.append(
+            ReverifyOutcomeItem(
+                proof_id=proof_id,
+                outcome=outcome,
+                before_status=REVERIFY_BEFORE_STATUS,
+                before_stage=before.stage,
+                before_code=before.code,
+                before_message=before.message,
+                after_status=after_status,
+                after_stage=after_stage,
+                after_code=after_code,
+                after_message=after_message,
+            )
+        )
+
+    return ReverifyOutcomeReport(
+        source_job_id=source.job_id,
+        retry_job_id=retry.job_id,
+        selected_proof_ids=selected_ids,
+        items=items,
+        recovered_proof_ids=recovered_ids,
+        still_failed_proof_ids=still_failed_ids,
+    )

@@ -75,6 +75,15 @@ class NoFailedProofError(QueueError):
     """completed 作业的结果中没有失败证明，无法发起复核。"""
 
 
+class ReverifyLineageMismatchError(QueueError):
+    """复核作业不是源作业的直接 ``reverify_failures`` 作业。
+
+    对账时要求复核作业确由该源作业直接复核生成；与
+    :class:`UnknownJobError`（作业不存在）和
+    :class:`ResultUnavailableError`（作业未 completed）互不替代。
+    """
+
+
 # ------------------------------------------------- 排队批量验证（任务流）
 
 class TaskValidationError(ZKBatchError):

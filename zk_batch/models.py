@@ -470,3 +470,78 @@ class RetryOutcomeReport:
             "still_failed_count": self.still_failed_count,
             "unresolved_count": self.unresolved_count,
         }
+
+
+# ================================================== 队列复核对账（reverify）
+
+# 对账前后状态（固定字面量）：入选项在源作业中固定为 failed；复核后
+# 只取 passed / failed。
+REVERIFY_BEFORE_STATUS = "failed"
+REVERIFY_AFTER_PASSED = "passed"
+REVERIFY_AFTER_FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class ReverifyOutcomeItem:
+    """单个复核证明的对账明细。
+
+    ``before_*`` 取自源作业保存的失败定位（``before_status`` 固定
+    ``failed``）；``after_*`` 取自复核作业的定位——恢复项
+    ``after_status`` 为 ``passed`` 且定位为空，仍失败项取复核
+    :class:`Failure` 的 ``stage``/``code``/``message``。``outcome``
+    只取 ``recovered`` / ``still_failed``。只承载定位信息，不含证明
+    材料、``public_inputs``、调用栈或未公开验证器信息。
+    """
+
+    proof_id: str
+    outcome: str
+    before_status: str
+    before_stage: str
+    before_code: str
+    before_message: str
+    after_status: str
+    after_stage: str
+    after_code: str
+    after_message: str
+
+    def to_dict(self) -> dict:
+        return {
+            "proof_id": self.proof_id,
+            "outcome": self.outcome,
+            "before_status": self.before_status,
+            "before_stage": self.before_stage,
+            "before_code": self.before_code,
+            "before_message": self.before_message,
+            "after_status": self.after_status,
+            "after_stage": self.after_stage,
+            "after_code": self.after_code,
+            "after_message": self.after_message,
+        }
+
+
+@dataclass(frozen=True)
+class ReverifyOutcomeReport:
+    """``reverify_failures`` 复核结果的只读对账报告。
+
+    ``selected_proof_ids`` 与 ``items`` 均按源批次原序排列；
+    ``recovered_proof_ids``/``still_failed_proof_ids`` 按结论归类、
+    各自保持源批次原序。只承载定位信息，不含证明材料、
+    ``public_inputs``、调用栈或未公开验证器信息。
+    """
+
+    source_job_id: str
+    retry_job_id: str
+    selected_proof_ids: List[str]
+    items: List[ReverifyOutcomeItem]
+    recovered_proof_ids: List[str]
+    still_failed_proof_ids: List[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "source_job_id": self.source_job_id,
+            "retry_job_id": self.retry_job_id,
+            "selected_proof_ids": list(self.selected_proof_ids),
+            "items": [item.to_dict() for item in self.items],
+            "recovered_proof_ids": list(self.recovered_proof_ids),
+            "still_failed_proof_ids": list(self.still_failed_proof_ids),
+        }

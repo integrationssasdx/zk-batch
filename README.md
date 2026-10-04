@@ -35,6 +35,26 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     回退单证验证各阶段的组级状态；查询报告不再次调用验证器，也不改变作业
     状态。仅 completed 作业可取结果/报告，queued/running/cancelled 抛
     `ResultUnavailableError`，未知或因执行错误移除的作业抛 `UnknownJobError`。
+  - `reverify_failures(job_id, verifiers=None)` 只挑出源作业结果中失败的
+    证明（按源批次原序、`batch_id` 与证明材料原样保留）创建独立的 queued
+    作业，并记录父子关系（复核作业 → 源作业）；重复复核得到不同 `job_id`，
+    父子关系互不覆盖。源作业不存在抛 `UnknownJobError`，非 completed 抛
+    `ResultUnavailableError`，无失败证明抛 `NoFailedProofError`。
+  - `reverify_outcome(source_job_id, retry_job_id)` 只读对账复核结果，返回
+    `ReverifyOutcomeReport`（固定键序 `to_dict`）：`source_job_id`、
+    `retry_job_id`、`selected_proof_ids`、`items`、`recovered_proof_ids`、
+    `still_failed_proof_ids`。对账范围严格沿用 `reverify_failures` 的选取，
+    各列表与 `items` 均按源批次原序；每条明细（`ReverifyOutcomeItem`，固定
+    键序 `to_dict`）含 `proof_id`、`outcome` 与 `before_*`/`after_*` 的
+    `status`/`stage`/`code`/`message`。`before_status` 固定 `failed`，
+    `before_*` 取源作业保存的失败定位；`after_*` 取复核定位——恢复项
+    `after_status="passed"` 且定位为空，仍失败项取复核 `Failure` 的同名字段；
+    `outcome` 只取 `recovered`/`still_failed`。对账只读已保存结果，不调用
+    验证器、不创建作业、不改变状态，重复查询一致，不含证明材料、
+    `public_inputs`、调用栈或未公开验证器信息。作业不存在抛
+    `UnknownJobError`，作业未 completed 抛 `ResultUnavailableError`，均
+    completed 但 `retry_job_id` 不是 `source_job_id` 的直接复核作业抛
+    `ReverifyLineageMismatchError`，三者互不替代。
 - `VerificationTaskQueue` —— 可排队、可定位失败原因的**逐项**批量验证队列，
   与上面的分组聚合队列相互独立；同样不起线程、不联网、不落盘。输入是一组
   按业务顺序排列的验证项，每项含稳定标识 `item_id`（非空字符串）与证明

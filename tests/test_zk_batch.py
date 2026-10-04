@@ -18,6 +18,7 @@ from zk_batch import (  # noqa: E402
     InvalidProofError,
     NoFailedProofError,
     ResultUnavailableError,
+    ReverifyLineageMismatchError,
     RunningJobError,
     UnknownJobError,
     UnsupportedProofSystemError,
@@ -880,6 +881,228 @@ class TestReverifyFailures(unittest.TestCase):
         q.reverify_failures(j, Groth16NonBool())
         with self.assertRaises(VerifierContractError):
             q.run_next()
+
+
+# ================================================================ 复核对账
+
+class FixExceptP3(StubVerifier):
+    """聚合验证只对含 p3 的组失败的假验证器（p3 回退后仍被拒）。"""
+
+    def __init__(self):
+        super().__init__(reject_ids={"p3"})
+
+    def verify_aggregate(self, proofs, aggregated):
+        self.calls["verify_aggregate"] += 1
+        return all(p.proof_id != "p3" for p in proofs)
+
+
+class TestReverifyOutcome(unittest.TestCase):
+    def _completed_job(self, q, proofs):
+        jid = q.enqueue({"batch_id": "B", "proofs": proofs})
+        return jid, q.run_next()
+
+    def _source_with_two_failures(self):
+        """源作业：p2 被拒、p3 验证异常；返回 (queue, job_id)。"""
+        flaky = StubVerifier(
+            agg_verify=False, reject_ids={"p2"}, error_ids={"p3"}
+        )
+        q = VerificationQueue(flaky)
+        proofs = [
+            proof("p1", key="k1"),
+            proof("p2", key="k1"),
+            proof("p3", key="k2"),
+            proof("p4", key="k2"),
+            proof("p5", key="k2"),
+        ]
+        j, source = self._completed_job(q, proofs)
+        self.assertEqual(source.failed, 2)
+        return q, j
+
+    def test_unknown_job(self):
+        q, j = self._source_with_two_failures()
+        new_j = q.reverify_failures(j, StubVerifier())
+        q.run_next()
+        with self.assertRaises(UnknownJobError):
+            q.reverify_outcome("ghost", new_j)
+        with self.assertRaises(UnknownJobError):
+            q.reverify_outcome(j, "ghost")
+        with self.assertRaises(UnknownJobError):
+            q.reverify_outcome("ghost", "ghost")
+
+    def test_not_completed_raises_unavailable(self):
+        q, j = self._source_with_two_failures()
+        # 复核作业仍 queued
+        new_j = q.reverify_failures(j, StubVerifier())
+        with self.assertRaises(ResultUnavailableError):
+            q.reverify_outcome(j, new_j)
+        # 复核作业 cancelled
+        q.cancel(new_j)
+        with self.assertRaises(ResultUnavailableError):
+            q.reverify_outcome(j, new_j)
+        # 源作业未 completed
+        q2 = VerificationQueue(StubVerifier())
+        queued = q2.enqueue({"batch_id": "B", "proofs": [proof("p1")]})
+        done, _ = self._completed_job(q2, [proof("p9")])
+        with self.assertRaises(ResultUnavailableError):
+            q2.reverify_outcome(queued, done)
+
+    def test_lineage_mismatch(self):
+        q, j = self._source_with_two_failures()
+        # 普通入队的 completed 作业不是复核作业
+        other, _ = self._completed_job(q, [proof("p9")])
+        with self.assertRaises(ReverifyLineageMismatchError):
+            q.reverify_outcome(j, other)
+        # 参数对调同样不匹配
+        new_j = q.reverify_failures(j, StubVerifier())
+        q.run_next()
+        with self.assertRaises(ReverifyLineageMismatchError):
+            q.reverify_outcome(new_j, j)
+        # 正向对账正常（p2、p3 均被修复）
+        self.assertEqual(
+            q.reverify_outcome(j, new_j).recovered_proof_ids, ["p2", "p3"]
+        )
+
+    def test_lineage_mismatch_other_source(self):
+        flaky = StubVerifier(agg_verify=False, reject_ids={"p1", "p2"})
+        q = VerificationQueue(flaky)
+        j1, _ = self._completed_job(q, [proof("p1")])
+        j2, _ = self._completed_job(q, [proof("p2")])
+        r1 = q.reverify_failures(j1, StubVerifier())
+        r2 = q.reverify_failures(j2, StubVerifier())
+        q.run_next()
+        q.run_next()
+        # 各自的直接复核作业不能交叉对账
+        with self.assertRaises(ReverifyLineageMismatchError):
+            q.reverify_outcome(j1, r2)
+        with self.assertRaises(ReverifyLineageMismatchError):
+            q.reverify_outcome(j2, r1)
+        # 重复复核得到不同 job_id，父子关系互不覆盖
+        self.assertEqual(
+            q.reverify_outcome(j1, r1).recovered_proof_ids, ["p1"]
+        )
+        self.assertEqual(
+            q.reverify_outcome(j2, r2).recovered_proof_ids, ["p2"]
+        )
+
+    def test_outcome_recovered_and_still_failed(self):
+        q, j = self._source_with_two_failures()
+        source_failures = {f.proof_id: f for f in q.result(j).failures}
+        # 复核：p2 修复通过，p3 仍被拒
+        fix = FixExceptP3()
+        new_j = q.reverify_failures(j, fix)
+        q.run_next()
+
+        report = q.reverify_outcome(j, new_j)
+        self.assertEqual(report.source_job_id, j)
+        self.assertEqual(report.retry_job_id, new_j)
+        # 按源批次原序
+        self.assertEqual(report.selected_proof_ids, ["p2", "p3"])
+        self.assertEqual(report.recovered_proof_ids, ["p2"])
+        self.assertEqual(report.still_failed_proof_ids, ["p3"])
+        self.assertEqual([i.proof_id for i in report.items], ["p2", "p3"])
+
+        recovered, still_failed = report.items
+        # before_* 固定取源作业失败定位
+        self.assertEqual(recovered.before_status, "failed")
+        self.assertEqual(recovered.before_stage, source_failures["p2"].stage)
+        self.assertEqual(recovered.before_code, "rejected")
+        self.assertEqual(
+            recovered.before_message, source_failures["p2"].message
+        )
+        self.assertEqual(still_failed.before_status, "failed")
+        self.assertEqual(still_failed.before_code, "verify_error")
+        # 恢复项 after_status=passed 且定位为空
+        self.assertEqual(recovered.outcome, "recovered")
+        self.assertEqual(recovered.after_status, "passed")
+        self.assertEqual(recovered.after_stage, "")
+        self.assertEqual(recovered.after_code, "")
+        self.assertEqual(recovered.after_message, "")
+        # 仍失败项取复核 Failure 定位
+        retry_failure = q.result(new_j).failures[0]
+        self.assertEqual(still_failed.outcome, "still_failed")
+        self.assertEqual(still_failed.after_status, "failed")
+        self.assertEqual(still_failed.after_stage, retry_failure.stage)
+        self.assertEqual(still_failed.after_code, retry_failure.code)
+        self.assertEqual(still_failed.after_message, retry_failure.message)
+
+    def test_to_dict_fixed_key_order(self):
+        q, j = self._source_with_two_failures()
+        new_j = q.reverify_failures(j, FixExceptP3())
+        q.run_next()
+        payload = q.reverify_outcome(j, new_j).to_dict()
+        self.assertEqual(
+            list(payload),
+            [
+                "source_job_id",
+                "retry_job_id",
+                "selected_proof_ids",
+                "items",
+                "recovered_proof_ids",
+                "still_failed_proof_ids",
+            ],
+        )
+        self.assertEqual(
+            list(payload["items"][0]),
+            [
+                "proof_id",
+                "outcome",
+                "before_status",
+                "before_stage",
+                "before_code",
+                "before_message",
+                "after_status",
+                "after_stage",
+                "after_code",
+                "after_message",
+            ],
+        )
+        # 不暴露证明材料或 public_inputs
+        self.assertNotIn("proof", payload)
+        self.assertNotIn("public_inputs", payload)
+
+    def test_read_only_and_idempotent(self):
+        q, j = self._source_with_two_failures()
+        fix = FixExceptP3()
+        new_j = q.reverify_failures(j, fix)
+        q.run_next()
+        calls = dict(fix.calls, verify=list(fix.calls["verify"]))
+
+        first = q.reverify_outcome(j, new_j)
+        second = q.reverify_outcome(j, new_j)
+        self.assertEqual(first.to_dict(), second.to_dict())
+        # 不再次调用验证器、不改变作业状态
+        self.assertEqual(fix.calls["aggregate"], calls["aggregate"])
+        self.assertEqual(fix.calls["verify_aggregate"], calls["verify_aggregate"])
+        self.assertEqual(fix.calls["verify"], calls["verify"])
+        self.assertEqual(q.status(j), "completed")
+        self.assertEqual(q.status(new_j), "completed")
+
+    def test_chain_reverify_lineage(self):
+        flaky = StubVerifier(agg_verify=False, reject_ids={"p1"})
+        q = VerificationQueue(flaky)
+        j, _ = self._completed_job(q, [proof("p1")])
+        j2 = q.reverify_failures(j)  # 仍失败
+        q.run_next()
+        j3 = q.reverify_failures(j2, StubVerifier())  # 修复
+        q.run_next()
+        # j3 是 j2 的直接复核，不是 j 的直接复核
+        with self.assertRaises(ReverifyLineageMismatchError):
+            q.reverify_outcome(j, j3)
+        report = q.reverify_outcome(j2, j3)
+        self.assertEqual(report.selected_proof_ids, ["p1"])
+        self.assertEqual(report.recovered_proof_ids, ["p1"])
+        # j -> j2 的对账：仍失败
+        report12 = q.reverify_outcome(j, j2)
+        self.assertEqual(report12.still_failed_proof_ids, ["p1"])
+        self.assertEqual(report12.items[0].outcome, "still_failed")
+
+    def test_failed_retry_job_removed_becomes_unknown(self):
+        q, j = self._source_with_two_failures()
+        new_j = q.reverify_failures(j, OtherVerifier())  # 不认识 groth16
+        with self.assertRaises(UnsupportedProofSystemError):
+            q.run_next()
+        with self.assertRaises(UnknownJobError):
+            q.reverify_outcome(j, new_j)
 
 
 if __name__ == "__main__":
