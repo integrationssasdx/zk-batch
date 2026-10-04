@@ -14,6 +14,7 @@ from .errors import (
     EmptyBatchError,
     IncompatibleAggregationError,
     InvalidProofError,
+    NoFailedProofError,
     ResultUnavailableError,
     RunningJobError,
     UnknownJobError,
@@ -49,4 +50,5 @@ __all__ = [
     "CancelledJobError",
     "UnknownJobError",
     "ResultUnavailableError",
+    "NoFailedProofError",
 ]

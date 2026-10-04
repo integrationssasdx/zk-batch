@@ -69,3 +69,7 @@ class UnknownJobError(QueueError):
 
 class ResultUnavailableError(QueueError):
     """作业不在 completed 状态时调用 result。"""
+
+
+class NoFailedProofError(QueueError):
+    """completed 作业的结果中没有失败证明，无法发起复核。"""

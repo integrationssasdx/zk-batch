@@ -13,6 +13,10 @@
   UnknownJobError；
 * :meth:`result` 仅 completed 返回 BatchVerificationResult，其余状态抛
   ResultUnavailableError（不存在抛 UnknownJobError）。
+* :meth:`reverify_failures` 以已完成作业的失败清单为输入，只挑出原批次中
+  失败的证明（保持相对顺序、batch_id 不变）创建新的 queued 作业。源作业
+  不存在抛 UnknownJobError；非 completed 抛 ResultUnavailableError；
+  completed 但无失败证明抛 NoFailedProofError。
 
 不持久化、不联网、不使用线程。
 """
@@ -27,6 +31,7 @@ from .engine import verify_batch
 from .errors import (
     CancelledJobError,
     CompletedJobError,
+    NoFailedProofError,
     ResultUnavailableError,
     RunningJobError,
     UnknownJobError,
@@ -122,6 +127,48 @@ class VerificationQueue:
                 f"job {job_id!r} has no result (status={job.status!r})"
             )
         return job.result  # type: ignore[return-value]
+
+    # ---------------------------------------------------------------- 复核
+
+    def reverify_failures(self, job_id: str, verifiers: Any = None) -> str:
+        """只重验已完成作业结果中的失败证明，返回新作业 id。
+
+        依据源作业保存的批次内容与失败清单，按 ``proof_id`` 挑出失败证明，
+        并按源批次中的相对顺序组成子批次（``batch_id`` 不变、
+        ``public_inputs``/``proof`` 原样保留），交给一个独立的 queued 作业；
+        不重提整批，源作业状态与结果保持不变。
+
+        ``verifiers`` 只作用于新作业，省略时使用队列默认验证器。新作业沿用
+        run_next/cancel/status/result；执行时仍走 verify_batch 的完整校验与
+        分组流水线。
+
+        * 源作业不存在 ——UnknownJobError；
+        * 存在但非 completed ——ResultUnavailableError；
+        * completed 但 failures 为空 ——NoFailedProofError。
+        """
+        job = self._require_job(job_id)
+        if job.status != STATUS_COMPLETED:
+            raise ResultUnavailableError(
+                f"job {job_id!r} has no result to reverify "
+                f"(status={job.status!r})"
+            )
+        source_result: BatchVerificationResult = job.result
+        failed_ids = {failure.proof_id for failure in source_result.failures}
+        if not failed_ids:
+            raise NoFailedProofError(
+                f"job {job_id!r} completed with no failed proofs"
+            )
+        # 从已保存的源批次选证：按原批次相对顺序，证明对象原样保留。
+        selected = [
+            raw
+            for raw in job.batch["proofs"]
+            if raw["proof_id"] in failed_ids
+        ]
+        sub_batch = {
+            "batch_id": source_result.batch_id,
+            "proofs": selected,
+        }
+        return self.enqueue(sub_batch, verifiers)
 
     # ---------------------------------------------------------------- 内部
 
