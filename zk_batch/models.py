@@ -222,3 +222,134 @@ class VerificationJob:
     status: str
     result: Any = None  # type: BatchVerificationResult | None
     error: Any = None   # 运行中抛出的异常（作业仍标记 completed？见 queue 说明）
+
+
+# ============================================================ 任务流（逐项）
+
+# 单批验证项数量的公开上限
+MAX_BATCH_ITEMS = 1000
+
+# 任务状态
+TASK_QUEUED = "queued"
+TASK_PROCESSING = "processing"
+TASK_COMPLETED = "completed"
+TASK_FAILED = "failed"
+TASK_TERMINAL_STATUSES = (TASK_COMPLETED, TASK_FAILED)
+
+# 逐项验证的失败阶段（固定字面量，与单证验证流水线一一对应）
+ITEM_STAGE_PROOF_READ = "proof_read"
+ITEM_STAGE_VERIFY = "verify"
+
+# 逐项结果状态
+ITEM_PASSED = "passed"
+ITEM_FAILED = "failed"
+
+# 可稳定比较的错误码
+ITEM_CODE_REJECTED = "rejected"          # 验证器判定不通过
+ITEM_CODE_INVALID_PROOF = "invalid_proof"      # 无法读取证明材料
+ITEM_CODE_VERIFIER_UNAVAILABLE = "verifier_unavailable"  # 无可用验证器
+ITEM_CODE_VERIFIER_FAULT = "verifier_fault"    # 验证器执行失败
+ITEM_CODE_SAVE_FAULT = "result_save_fault"     # 无法保存最终结果
+
+
+@dataclass(frozen=True)
+class ItemResult:
+    """单个验证项的结果，顺序与输入一致。
+
+    仅承载定位信息：``index``（输入序号，0 起）、``item_id``、``status``
+    （``passed``/``failed``）、``stage``、``code`` 与供人工定位的
+    ``message``。绝不包含完整证明材料、内部调用栈或未公开验证器信息。
+    """
+
+    index: int
+    item_id: str
+    status: str
+    stage: str = ""
+    code: str = ""
+    message: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "item_id": self.item_id,
+            "status": self.status,
+            "stage": self.stage,
+            "code": self.code,
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
+class BatchSummary:
+    """提交时返回的当前批次摘要（不含证明材料）。"""
+
+    total: int
+    item_ids: List[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "total": self.total,
+            "item_ids": list(self.item_ids),
+        }
+
+
+@dataclass(frozen=True)
+class TaskSubmission:
+    """提交成功的回执：稳定任务标识、排队状态与批次摘要。"""
+
+    task_id: str
+    status: str
+    summary: BatchSummary
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "status": self.status,
+            "summary": self.summary.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class BatchTaskResult:
+    """整批逐项验证的聚合结果。
+
+    ``results`` 与输入顺序一致；``failed_item_ids`` 为失败项标识列表，
+    同样按输入顺序（不做额外排序），满足 ``total == passed + failed``。
+    """
+
+    task_id: str
+    total: int
+    passed: int
+    failed: int
+    results: List[ItemResult]
+    failed_item_ids: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "total": self.total,
+            "passed": self.passed,
+            "failed": self.failed,
+            "results": [r.to_dict() for r in self.results],
+            "failed_item_ids": list(self.failed_item_ids),
+        }
+
+
+@dataclass(frozen=True)
+class TaskProgress:
+    """任务处理进度快照；未结束时 ``result`` 为 ``None``。"""
+
+    task_id: str
+    status: str
+    total: int
+    completed: int
+    result: Any = None  # type: BatchTaskResult | None
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "status": self.status,
+            "total": self.total,
+            "completed": self.completed,
+            "result": None if self.result is None else self.result.to_dict(),
+        }
