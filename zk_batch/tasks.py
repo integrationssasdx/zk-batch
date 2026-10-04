@@ -22,6 +22,9 @@
 * 系统无法读取证明材料、验证器执行失败或无法保存最终结果时抛
   :class:`VerificationInfrastructureError`，任务进入 ``failed`` 终态，
   此前已完成项的结果与定位信息完整保留；终态结果查询幂等。
+* :meth:`retry_failed` 从 completed/failed 源任务挑出待复核项，按根任务
+  输入顺序创建独立的 queued 任务（新任务标识，``ItemResult.index`` 保留
+  根任务下标）；源任务的状态、结果与错误定位不受影响。
 
 不持久化、不联网、不使用线程。失败定位只含输入序号、项标识、失败阶段、
 稳定错误码与供人工定位的描述，绝不包含完整证明材料、内部调用栈或未公开
@@ -48,6 +51,7 @@ from .errors import (
     EmptyBatchError,
     InvalidItemIdError,
     InvalidProofFormatError,
+    NoRetryableItemsError,
     TaskNotFoundError,
     TaskStateConflictError,
     VerificationInfrastructureError,
@@ -68,11 +72,13 @@ from .models import (
     TASK_FAILED,
     TASK_PROCESSING,
     TASK_QUEUED,
+    TASK_TERMINAL_STATUSES,
     BatchSummary,
     BatchTaskResult,
     ItemResult,
     Proof,
     TaskProgress,
+    TaskRetrySubmission,
     TaskSubmission,
 )
 
@@ -94,10 +100,17 @@ class _ProofReadError(Exception):
 class _TaskRecord:
     """队列内部的任务记录（不对外暴露）。"""
 
-    def __init__(self, task_id: str, items: List[dict], verifiers: Any):
+    def __init__(self, task_id: str, items: List[dict], verifiers: Any,
+                 indexes: Optional[List[int]] = None):
         self.task_id = task_id
         self.items = items
         self.verifiers = verifiers
+        # 每项在根任务输入中的零起下标；普通提交为恒等映射，复核任务
+        # 保留源任务下标，使结果与再次失败的定位都指向最初提交。
+        self.indexes: List[int] = (
+            list(indexes) if indexes is not None
+            else list(range(len(items)))
+        )
         self.status: str = TASK_QUEUED
         self.total: int = len(items)
         self.results: List[ItemResult] = []
@@ -155,6 +168,64 @@ class VerificationTaskQueue:
             task_id=task_id,
             status=TASK_QUEUED,
             summary=BatchSummary(total=len(normalized), item_ids=item_ids),
+        )
+
+    # --------------------------------------------------------------- 复核
+
+    def retry_failed(
+        self, task_id: str, verifiers: Any = None
+    ) -> TaskRetrySubmission:
+        """从终态源任务挑出待复核项，创建新的 queued 任务并返回
+        :class:`TaskRetrySubmission`。
+
+        选取规则（下标均为根任务输入的零起序号）：
+
+        * completed —— 只选结果中 ``status=failed`` 的项；
+        * failed —— 从保留的 :class:`VerificationInfrastructureError`
+          的 ``index`` 对应项起，纳入该错误项及其后尚无结果的项，再与
+          已有失败项按根任务输入顺序去重；``index`` 为 ``None``（如
+          result_save 失败且结果已覆盖全部输入）时只选失败项。
+
+        新任务按根任务输入顺序逐项验证入选项，每项只验证一次；
+        ``ItemResult.index`` 与再次失败时的错误定位都保留根任务下标，
+        沿用 run_next/run_task/status/progress/result/task_error 查询。
+        重复复核生成不同的新任务标识；源任务的状态、结果、错误定位与
+        保存历史不受影响。
+
+        ``verifiers`` 只作用于新任务（解析与契约异常口径与
+        :meth:`submit` 相同），省略时继承源任务的验证器选择。
+
+        * 源任务不存在 ——:class:`TaskNotFoundError`；
+        * 源任务为 queued/processing ——:class:`TaskStateConflictError`；
+        * 没有可复核项 ——:class:`NoRetryableItemsError`。
+        """
+        record = self._require_task(task_id)
+        if record.status not in TASK_TERMINAL_STATUSES:
+            raise TaskStateConflictError(
+                f"task {task_id!r} cannot be retried in status "
+                f"{record.status!r}"
+            )
+        selected = _select_retry_indexes(record)
+        if not selected:
+            raise NoRetryableItemsError(
+                f"task {task_id!r} has no retryable items"
+            )
+        chosen = verifiers if verifiers is not None else record.verifiers
+        positions = {index: pos for pos, index in enumerate(record.indexes)}
+        items = [record.items[positions[index]] for index in selected]
+        new_task_id = f"task-{next(self._counter)}"
+        self._tasks[new_task_id] = _TaskRecord(
+            new_task_id, items, chosen, indexes=selected
+        )
+        return TaskRetrySubmission(
+            source_task_id=task_id,
+            task_id=new_task_id,
+            status=TASK_QUEUED,
+            summary=BatchSummary(
+                total=len(items),
+                item_ids=[item["item_id"] for item in items],
+            ),
+            retried_indexes=list(selected),
         )
 
     # --------------------------------------------------------------- 消费
@@ -278,7 +349,9 @@ class VerificationTaskQueue:
                 message=MSG_VERIFIER_FAULT.format(detail=_exc_message(exc)),
             )
 
-        for index, item in enumerate(record.items):
+        for position, item in enumerate(record.items):
+            # 结果与错误定位一律使用根任务输入下标（普通任务为恒等映射）。
+            index = record.indexes[position]
             item_id = item["item_id"]
             material = item["proof"]
 
@@ -394,6 +467,32 @@ class VerificationTaskQueue:
         if record is None:
             raise TaskNotFoundError(f"unknown task id: {task_id!r}")
         return record
+
+
+# ============================================================ 复核项选取
+
+def _select_retry_indexes(record: _TaskRecord) -> List[int]:
+    """按根任务输入顺序选出待复核项的下标（升序、去重）。
+
+    completed：只选失败项。failed：错误项及其后尚无结果的项，再并入
+    已有失败项；错误无明确项下标（如 result_save 失败）时，尚无结果
+    的项从整批起算——结果已覆盖全部输入时自然只剩失败项。
+    """
+    failed = {r.index for r in record.results if r.status == ITEM_FAILED}
+    if record.status == TASK_COMPLETED:
+        return sorted(failed)
+    done = {r.index for r in record.results}
+    error = record.error
+    start = (
+        error.index
+        if (error is not None and error.index is not None)
+        else 0
+    )
+    pending = {
+        index for index in record.indexes
+        if index >= start and index not in done
+    }
+    return sorted(failed | pending)
 
 
 # ============================================================ 提交前校验

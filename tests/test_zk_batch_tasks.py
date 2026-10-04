@@ -14,7 +14,11 @@
 * 基础设施错误：无法读取材料（invalid_proof）、验证器执行失败
   （verifier_fault）、无验证器（verifier_unavailable）、无法保存结果
   （result_save_fault），均保留此前已完成项；
-* 终态与结果查询幂等，不再次调用验证器。
+* 终态与结果查询幂等，不再次调用验证器；
+* 复核：retry_failed 从 completed/failed 源任务选取待复核项（失败项、
+  错误项及其后无结果项，按根任务输入顺序去重），生成独立 queued 任务，
+  ItemResult.index 保留根任务下标；NoRetryableItemsError /
+  TaskNotFoundError / TaskStateConflictError 互不替代。
 
 直接运行：python tests/test_zk_batch_tasks.py
 """
@@ -33,8 +37,10 @@ from zk_batch import (  # noqa: E402
     InvalidProofFormatError,
     ItemResult,
     MAX_BATCH_ITEMS,
+    NoRetryableItemsError,
     TaskNotFoundError,
     TaskProgress,
+    TaskRetrySubmission,
     TaskStateConflictError,
     VerificationInfrastructureError,
     VerificationTaskQueue,
@@ -592,6 +598,248 @@ class TestIdempotency(unittest.TestCase):
         self.assertEqual(v.verified, ["p1", "p2"])
         # 状态不因查询变化
         self.assertEqual(q.status(tid), "completed")
+
+
+# ================================================================ 复核
+
+class TestRetryFailed(unittest.TestCase):
+    def test_completed_selects_only_failed_items(self):
+        v = StubVerifier(reject_ids={"p2", "p4"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit(
+            [item("p1"), item("p2"), item("p3"), item("p4")]
+        ).task_id
+        q.run_next()
+        receipt = q.retry_failed(tid)
+        self.assertIsInstance(receipt, TaskRetrySubmission)
+        self.assertEqual(receipt.source_task_id, tid)
+        self.assertNotEqual(receipt.task_id, tid)
+        self.assertEqual(receipt.status, "queued")
+        self.assertEqual(receipt.summary.total, 2)
+        self.assertEqual(receipt.summary.item_ids, ["p2", "p4"])
+        self.assertEqual(receipt.retried_indexes, [1, 3])
+        self.assertEqual(q.status(receipt.task_id), "queued")
+        # to_dict 固定字段顺序，summary 走 BatchSummary.to_dict
+        self.assertEqual(
+            list(receipt.to_dict()),
+            ["source_task_id", "task_id", "status",
+             "summary", "retried_indexes"],
+        )
+        self.assertEqual(
+            receipt.to_dict(),
+            {
+                "source_task_id": tid,
+                "task_id": receipt.task_id,
+                "status": "queued",
+                "summary": {"total": 2, "item_ids": ["p2", "p4"]},
+                "retried_indexes": [1, 3],
+            },
+        )
+
+    def test_retry_task_preserves_root_indexes(self):
+        v = StubVerifier(reject_ids={"p2", "p4"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit(
+            [item("p1"), item("p2"), item("p3"), item("p4")]
+        ).task_id
+        q.run_next()
+        self.assertEqual(v.verified, ["p1", "p2", "p3", "p4"])
+
+        v2 = StubVerifier(reject_ids={"p4"})
+        receipt = q.retry_failed(tid, verifiers=v2)
+        result = q.run_task(receipt.task_id)
+        # 只验证入选项，每项恰好一次
+        self.assertEqual(v2.verified, ["p2", "p4"])
+        # ItemResult.index 保留根任务下标
+        self.assertEqual(
+            [(r.index, r.item_id, r.status) for r in result.results],
+            [(1, "p2", "passed"), (3, "p4", "failed")],
+        )
+        self.assertEqual((result.total, result.passed, result.failed),
+                         (2, 1, 1))
+        self.assertEqual(result.failed_item_ids, ["p4"])
+        # 沿用既有查询：status/progress/result/task_error
+        self.assertEqual(q.status(receipt.task_id), "completed")
+        self.assertIs(q.result(receipt.task_id), result)
+        self.assertIs(q.progress(receipt.task_id).result, result)
+        self.assertIsNone(q.task_error(receipt.task_id))
+
+    def test_failed_source_selects_error_item_tail_and_failed(self):
+        v = StubVerifier(reject_ids={"p2"}, error_ids={"p4"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit(
+            [item("p1"), item("p2"), item("p3"), item("p4"), item("p5")]
+        ).task_id
+        with self.assertRaises(VerificationInfrastructureError):
+            q.run_next()
+        receipt = q.retry_failed(tid)
+        # p2 已有失败结果 + p4 错误项 + p5 尚无结果项，按根任务输入顺序去重
+        self.assertEqual(receipt.retried_indexes, [1, 3, 4])
+        self.assertEqual(receipt.summary.item_ids, ["p2", "p4", "p5"])
+
+    def test_save_fault_with_full_coverage_selects_only_failed(self):
+        def store(result):
+            raise OSError("disk full")
+
+        v = StubVerifier(reject_ids={"p2"})
+        q = VerificationTaskQueue(v, result_store=store)
+        tid = q.submit([item("p1"), item("p2"), item("p3")]).task_id
+        with self.assertRaises(VerificationInfrastructureError):
+            q.run_next()
+        receipt = q.retry_failed(tid)
+        # 结果已覆盖全部输入：只选失败项
+        self.assertEqual(receipt.retried_indexes, [1])
+        self.assertEqual(receipt.summary.item_ids, ["p2"])
+
+    def test_no_retryable_items(self):
+        # completed 且全部通过
+        q = VerificationTaskQueue(StubVerifier())
+        tid = q.submit([item("p1"), item("p2")]).task_id
+        q.run_next()
+        with self.assertRaises(NoRetryableItemsError):
+            q.retry_failed(tid)
+
+        # result_save 失败、结果覆盖全部输入且全部通过
+        def store(result):
+            raise OSError("disk full")
+
+        q2 = VerificationTaskQueue(StubVerifier(), result_store=store)
+        t2 = q2.submit([item("p1")]).task_id
+        with self.assertRaises(VerificationInfrastructureError):
+            q2.run_next()
+        with self.assertRaises(NoRetryableItemsError) as ctx:
+            q2.retry_failed(t2)
+        # 异常消息不含证明材料与验证器信息
+        msg = str(ctx.exception)
+        self.assertNotIn("blob", msg)
+        self.assertNotIn("public_inputs", msg)
+        self.assertNotIn("Verifier", msg)
+
+    def test_unknown_task(self):
+        q = VerificationTaskQueue(StubVerifier())
+        with self.assertRaises(TaskNotFoundError):
+            q.retry_failed("ghost")
+
+    def test_non_terminal_source_conflict(self):
+        v = StubVerifier()
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("a")]).task_id
+        # queued 源任务
+        with self.assertRaises(TaskStateConflictError):
+            q.retry_failed(tid)
+
+        # processing 源任务（验证器回调内重入）
+        def reenter(proof):
+            with self.assertRaises(TaskStateConflictError):
+                q.retry_failed(tid)
+            return True
+
+        v.verify = reenter
+        q.run_next()
+
+    def test_verifiers_omitted_inherits_source_choice(self):
+        # 队列默认全部通过；源任务提交时给定拒绝 p2 的验证器
+        source_v = StubVerifier(reject_ids={"p2"})
+        q = VerificationTaskQueue(StubVerifier())
+        tid = q.submit(
+            [item("p1"), item("p2")], verifiers=source_v
+        ).task_id
+        q.run_next()
+        # 省略 verifiers：继承源任务选择，而非队列默认
+        receipt = q.retry_failed(tid)
+        result = q.run_task(receipt.task_id)
+        self.assertEqual(result.failed_item_ids, ["p2"])
+        # 显式 verifiers 只作用于新任务
+        pass_v = StubVerifier()
+        receipt2 = q.retry_failed(tid, verifiers=pass_v)
+        r2 = q.run_task(receipt2.task_id)
+        self.assertEqual(r2.failed_item_ids, [])
+        self.assertEqual(pass_v.verified, ["p2"])
+        # 源任务结果不受影响
+        self.assertEqual(q.result(tid).failed_item_ids, ["p2"])
+
+    def test_verifiers_contract_error_surfaces_at_execution(self):
+        source_v = StubVerifier(reject_ids={"p1"})
+        source_v.protocol = "halo2"
+        q = VerificationTaskQueue(source_v)
+        tid = q.submit(
+            [item("p1", material("p1", proto="halo2"))]
+        ).task_id
+        q.run_next()
+        # 与 submit 同口径：契约异常在执行期转化为基础设施错误，
+        # retry_failed 本身不抛
+        receipt = q.retry_failed(tid, verifiers=VerifyLessVerifier())
+        with self.assertRaises(VerificationInfrastructureError) as ctx:
+            q.run_task(receipt.task_id)
+        self.assertEqual(ctx.exception.code, "verifier_fault")
+        self.assertEqual(q.status(receipt.task_id), "failed")
+
+    def test_repeated_retries_distinct_ids_stable_order(self):
+        v = StubVerifier(reject_ids={"p3", "p1"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("p1"), item("p2"), item("p3")]).task_id
+        result = q.run_next()
+        r1 = q.retry_failed(tid)
+        r2 = q.retry_failed(tid)
+        self.assertNotEqual(r1.task_id, r2.task_id)
+        self.assertEqual(r1.retried_indexes, [0, 2])
+        self.assertEqual(r2.retried_indexes, [0, 2])
+        # 源任务状态、结果与错误定位不变
+        self.assertEqual(q.status(tid), "completed")
+        self.assertIs(q.result(tid), result)
+        self.assertIsNone(q.task_error(tid))
+        # 两个复核任务各自独立排队
+        self.assertEqual(q.status(r1.task_id), "queued")
+        self.assertEqual(q.status(r2.task_id), "queued")
+
+    def test_retry_of_retry_keeps_root_indexes(self):
+        v = StubVerifier(reject_ids={"p2"}, error_ids={"p4"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit(
+            [item("p1"), item("p2"), item("p3"), item("p4")]
+        ).task_id
+        with self.assertRaises(VerificationInfrastructureError):
+            q.run_next()
+        # 第一轮复核：p2 失败 + p4 错误项（根任务下标 1、3）
+        first = q.retry_failed(tid)
+        self.assertEqual(first.retried_indexes, [1, 3])
+        # 继承的源验证器仍会在 p4 上出错：再次失败仍定位根任务下标
+        with self.assertRaises(VerificationInfrastructureError) as ctx:
+            q.run_task(first.task_id)
+        err = ctx.exception
+        self.assertEqual((err.index, err.item_id), (3, "p4"))
+        self.assertEqual(
+            [(r.index, r.item_id, r.status)
+             for r in q.result(first.task_id).results],
+            [(1, "p2", "failed")],
+        )
+        # 第二轮复核：p2 已有失败结果 + p4 错误项，仍按根任务下标
+        second = q.retry_failed(first.task_id)
+        self.assertEqual(second.source_task_id, first.task_id)
+        self.assertEqual(second.retried_indexes, [1, 3])
+        # 用全部通过的验证器执行第二轮复核
+        pass_v = StubVerifier()
+        third = q.retry_failed(first.task_id, verifiers=pass_v)
+        r3 = q.run_task(third.task_id)
+        self.assertEqual(pass_v.verified, ["p2", "p4"])
+        self.assertEqual(
+            [(r.index, r.item_id, r.status) for r in r3.results],
+            [(1, "p2", "passed"), (3, "p4", "passed")],
+        )
+        # 全部通过后无可复核项
+        with self.assertRaises(NoRetryableItemsError):
+            q.retry_failed(third.task_id)
+
+    def test_retry_task_consumed_via_run_next_fifo(self):
+        v = StubVerifier(reject_ids={"p1"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("p1")]).task_id
+        q.run_next()
+        receipt = q.retry_failed(tid, verifiers=StubVerifier())
+        other = q.submit([item("x")]).task_id
+        # 复核任务先入队，run_next 按 FIFO 消费
+        self.assertEqual(q.run_next().task_id, receipt.task_id)
+        self.assertEqual(q.run_next().task_id, other)
 
 
 if __name__ == "__main__":

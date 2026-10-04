@@ -121,6 +121,15 @@ class TaskStateConflictError(TaskError):
     """重复消费、终态后再次入队或任务状态互相冲突。"""
 
 
+class NoRetryableItemsError(TaskError):
+    """复核源任务没有任何可重试的验证项。
+
+    源任务既没有失败的验证项，也没有因基础设施错误而未得出结果的
+    后续项时抛出；与 :class:`TaskNotFoundError`（任务不存在）和
+    :class:`TaskStateConflictError`（任务未终结）互不替代。
+    """
+
+
 class VerificationInfrastructureError(TaskError):
     """基础设施失败：无法读取证明材料、验证器执行失败或无法保存最终结果。
 

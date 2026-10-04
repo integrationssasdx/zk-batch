@@ -71,6 +71,20 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     仍为整批总数）；错误对象固定携带 `index`/`item_id`/`stage`/`code`。
   - 终态与结果查询保持幂等：不再次调用验证器、不改变状态，重复查询返回同一
     结果对象；定位信息绝不包含完整证明材料、内部调用栈或未公开验证器信息。
+  - `retry_failed(task_id, verifiers=None)` 从 completed/failed 源任务选取
+    待复核项，按根任务输入顺序创建独立的 queued 任务，返回
+    `TaskRetrySubmission`（`source_task_id`、`task_id`、`status="queued"`、
+    `summary`、`retried_indexes` 根任务输入零起下标）。completed 只选
+    `status="failed"` 的项；failed 从保留的
+    `VerificationInfrastructureError.index` 对应项起，纳入该错误项及其后
+    尚无结果的项，再与已有失败项按根任务输入顺序去重（`result_save` 失败
+    且结果已覆盖全部输入时只选失败项）。新任务沿用
+    `run_next`/`run_task`/`status`/`progress`/`result`/`task_error`，每项只
+    验证一次，`ItemResult.index` 与再次失败的定位都保留根任务下标；重复
+    复核生成不同任务标识，源任务状态、结果与错误定位不变。`verifiers` 只
+    作用于新任务，省略时继承源任务的验证器选择。无可复核项抛
+    `NoRetryableItemsError`，未知任务抛 `TaskNotFoundError`，queued 或
+    processing 源任务抛 `TaskStateConflictError`，三者互不替代。
 
 ## 约定
 
