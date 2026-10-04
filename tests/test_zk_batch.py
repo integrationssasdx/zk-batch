@@ -9,14 +9,17 @@ import unittest
 sys.path.insert(0, ".")
 
 from zk_batch import (  # noqa: E402
+    BatchVerificationReport,
     BatchVerificationResult,
     CancelledJobError,
     CompletedJobError,
     DuplicateProofIdError,
     EmptyBatchError,
+    GroupVerificationReport,
     IncompatibleAggregationError,
     InvalidProofError,
     NoFailedProofError,
+    ProofVerificationDetail,
     ResultUnavailableError,
     RunningJobError,
     UnknownJobError,
@@ -25,6 +28,7 @@ from zk_batch import (  # noqa: E402
     VerifierContractError,
     ZKVerifier,
     verify_batch,
+    verify_batch_detailed,
 )
 
 
@@ -547,6 +551,336 @@ class TestFailureGroups(unittest.TestCase):
         groups = result.failure_groups()
         self.assertEqual(groups[0]["failed_proof_ids"], ["p1", "p2", "p3"])
         self.assertEqual(groups[0]["failed_count"], 3)
+
+
+# ================================================================ 详细报告
+
+class TestVerifyBatchDetailed(unittest.TestCase):
+    def test_aggregate_success_group(self):
+        # 场景一：聚合成功且聚合验证通过
+        v = StubVerifier()
+        batch = {
+            "batch_id": "B",
+            "proofs": [proof("p1", key="k1"), proof("p2", key="k1"),
+                       proof("p3", key="k2")],
+        }
+        report = verify_batch_detailed(batch, v)
+        self.assertIsInstance(report, BatchVerificationReport)
+        self.assertEqual(report.result.passed, 3)
+        self.assertEqual(report.result.failed, 0)
+        # groups 按首次出现顺序
+        self.assertEqual(
+            [g.group_id for g in report.groups],
+            ["groth16:c1:k1", "groth16:c1:k2"],
+        )
+        g = report.groups[0]
+        self.assertIsInstance(g, GroupVerificationReport)
+        # 组内 proof_id 保持原序
+        self.assertEqual(g.proof_ids, ["p1", "p2"])
+        self.assertEqual(g.aggregate_status, "succeeded")
+        self.assertEqual(g.aggregate_message, "")
+        self.assertEqual(g.aggregate_verify_status, "passed")
+        self.assertEqual(g.aggregate_verify_message, "")
+        self.assertFalse(g.fell_back)
+        self.assertEqual(
+            [(d.proof_id, d.status, d.message) for d in g.proofs],
+            [("p1", "passed", ""), ("p2", "passed", "")],
+        )
+        self.assertTrue(
+            all(isinstance(d, ProofVerificationDetail) for d in g.proofs)
+        )
+
+    def test_aggregate_exception_group(self):
+        # 场景二：aggregate 抛非 IncompatibleAggregationError 异常
+        class BoomAggregate(StubVerifier):
+            def aggregate(self, proofs):
+                self.calls["aggregate"] += 1
+                raise RuntimeError("aggregator down")
+
+        v = BoomAggregate()
+        report = verify_batch_detailed(
+            {"batch_id": "B", "proofs": [proof("p1"), proof("p2")]}, v
+        )
+        g = report.groups[0]
+        self.assertEqual(g.aggregate_status, "error")
+        self.assertEqual(g.aggregate_message, "RuntimeError: aggregator down")
+        self.assertEqual(g.aggregate_verify_status, "not_run")
+        self.assertEqual(g.aggregate_verify_message, "")
+        self.assertFalse(g.fell_back)
+        # 组内逐证均为 not_run、消息为空
+        self.assertEqual(
+            [(d.proof_id, d.status, d.message) for d in g.proofs],
+            [("p1", "not_run", ""), ("p2", "not_run", "")],
+        )
+        self.assertEqual(v.calls["verify"], [])
+        # result 仍记两证失败，归责 aggregate
+        self.assertEqual(report.result.failed, 2)
+        self.assertTrue(
+            all(f.stage == "aggregate" for f in report.result.failures)
+        )
+
+    def test_aggregate_exception_empty_str_message_keeps_type_name(self):
+        class SilentBoom(StubVerifier):
+            def aggregate(self, proofs):
+                raise RuntimeError()
+
+        report = verify_batch_detailed(
+            {"batch_id": "B", "proofs": [proof("p1")]}, SilentBoom()
+        )
+        g = report.groups[0]
+        self.assertEqual(g.aggregate_message, "RuntimeError")
+        self.assertEqual(g.proofs[0].message, "")
+
+    def test_incompatible_aggregation_raises_no_report(self):
+        v = StubVerifier(aggregate_ok=False)
+        with self.assertRaises(IncompatibleAggregationError):
+            verify_batch_detailed(
+                {"batch_id": "B", "proofs": [proof("p1"), proof("p2")]}, v
+            )
+
+    def test_aggregate_rejected_falls_back_partial_failures(self):
+        # 场景三 + 场景四：聚合验证 rejected 并回退，部分单证失败
+        v = StubVerifier(agg_verify=False, reject_ids={"p2"}, error_ids={"p3"})
+        batch = {"batch_id": "B",
+                 "proofs": [proof("p1"), proof("p2"), proof("p3")]}
+        report = verify_batch_detailed(batch, v)
+        g = report.groups[0]
+        self.assertEqual(g.aggregate_status, "succeeded")
+        self.assertEqual(g.aggregate_verify_status, "rejected")
+        self.assertEqual(g.aggregate_verify_message, "")
+        self.assertTrue(g.fell_back)
+        # 回退后逐证按原序：passed / rejected / error
+        self.assertEqual(
+            [(d.proof_id, d.status, d.message) for d in g.proofs],
+            [
+                ("p1", "passed", ""),
+                ("p2", "rejected", "proof rejected by verifier"),
+                ("p3", "error", "ValueError: bad proof bytes"),
+            ],
+        )
+        self.assertEqual(report.result.passed, 1)
+        self.assertEqual(report.result.failed, 2)
+
+    def test_all_singles_pass_but_aggregate_rejected(self):
+        # 场景五：单证全通过但聚合验证 rejected，failures 归责 aggregate_verify
+        v = StubVerifier(agg_verify=False)
+        report = verify_batch_detailed(
+            {"batch_id": "B", "proofs": [proof("p1"), proof("p2")]}, v
+        )
+        g = report.groups[0]
+        self.assertEqual(g.aggregate_verify_status, "rejected")
+        self.assertTrue(g.fell_back)
+        self.assertEqual(
+            [d.status for d in g.proofs], ["passed", "passed"]
+        )
+        self.assertEqual(report.result.failed, 2)
+        self.assertTrue(
+            all(f.stage == "aggregate_verify" and f.code == "rejected"
+                for f in report.result.failures)
+        )
+
+    def test_aggregate_verify_exception_falls_back(self):
+        # verify_aggregate 抛异常 -> error 并回退；逐证全过时归责聚合验证
+        v = StubVerifier(agg_error=True)
+        report = verify_batch_detailed(
+            {"batch_id": "B", "proofs": [proof("p1"), proof("p2")]}, v
+        )
+        g = report.groups[0]
+        self.assertEqual(g.aggregate_status, "succeeded")
+        self.assertEqual(g.aggregate_verify_status, "error")
+        self.assertEqual(
+            g.aggregate_verify_message, "RuntimeError: aggregate verifier exploded"
+        )
+        self.assertTrue(g.fell_back)
+        self.assertEqual([d.status for d in g.proofs], ["passed", "passed"])
+        self.assertTrue(
+            all(f.stage == "aggregate_verify" and f.code == "verify_error"
+                for f in report.result.failures)
+        )
+
+    def test_aggregate_verify_exception_then_single_error(self):
+        # 聚合验证异常 + 回退后单证也异常：逐证记 error，归责 single_verify
+        v = StubVerifier(agg_error=True, error_ids={"p2"})
+        report = verify_batch_detailed(
+            {"batch_id": "B", "proofs": [proof("p1"), proof("p2")]}, v
+        )
+        g = report.groups[0]
+        self.assertEqual(g.aggregate_verify_status, "error")
+        self.assertTrue(g.fell_back)
+        self.assertEqual(
+            [(d.proof_id, d.status) for d in g.proofs],
+            [("p1", "passed"), ("p2", "error")],
+        )
+        by_id = {f.proof_id: f for f in report.result.failures}
+        self.assertEqual(by_id["p2"].stage, "single_verify")
+        self.assertEqual(by_id["p2"].code, "verify_error")
+
+    def test_groups_follow_first_appearance_and_inner_original_order(self):
+        # 批次序：k2(z1) -> k1(a2,m2) -> k2(z2)；报告组按首次出现序 k2,k1，
+        # 且同组证明保持批次原序（与 failure_groups 的 group_id 排序不同）。
+        v = StubVerifier(agg_verify=False, reject_ids={"z1", "a2", "z2"})
+        batch = {
+            "batch_id": "B",
+            "proofs": [
+                proof("z1", key="k2"),
+                proof("a2", key="k1"),
+                proof("m2", key="k1"),
+                proof("z2", key="k2"),
+            ],
+        }
+        report = verify_batch_detailed(batch, v)
+        self.assertEqual(
+            [g.group_id for g in report.groups],
+            ["groth16:c1:k2", "groth16:c1:k1"],
+        )
+        self.assertEqual(report.groups[0].proof_ids, ["z1", "z2"])
+        self.assertEqual(
+            [d.proof_id for d in report.groups[0].proofs], ["z1", "z2"]
+        )
+        self.assertEqual(report.groups[1].proof_ids, ["a2", "m2"])
+
+    def test_result_identical_to_verify_batch(self):
+        # 两个入口在相同输入下 result 各字段完全一致
+        batch = {
+            "batch_id": ("any", "id"),
+            "proofs": [
+                proof("z", key="k2"),
+                proof("a", key="k1"),
+                proof("m", key="k1"),
+            ],
+        }
+        plain = verify_batch(batch, StubVerifier(
+            agg_verify=False, reject_ids={"z", "a"}, error_ids={"m"}))
+        detailed = verify_batch_detailed(batch, StubVerifier(
+            agg_verify=False, reject_ids={"z", "a"}, error_ids={"m"}))
+        self.assertEqual(plain.to_dict(), detailed.result.to_dict())
+        self.assertEqual(plain.batch_id, detailed.result.batch_id)
+        self.assertEqual(plain.aggregate_count, detailed.result.aggregate_count)
+        self.assertEqual(plain.passed, detailed.result.passed)
+        self.assertEqual(plain.failed, detailed.result.failed)
+
+    def test_shared_pipeline_parity_across_scenarios(self):
+        scenarios = [
+            {},
+            {"agg_verify": False},
+            {"agg_verify": False, "reject_ids": {"p2"}},
+            {"agg_verify": False, "reject_ids": {"p2"}, "error_ids": {"p3"}},
+            {"agg_error": True},
+        ]
+        batch = {"batch_id": "B",
+                 "proofs": [proof("p1"), proof("p2"), proof("p3")]}
+        for kw in scenarios:
+            with self.subTest(kw=kw):
+                r1 = verify_batch(batch, StubVerifier(**kw)).to_dict()
+                r2 = verify_batch_detailed(batch, StubVerifier(**kw)).result.to_dict()
+                self.assertEqual(r1, r2)
+
+    def test_error_parity_between_entry_points(self):
+        # 空批次、字段缺失/类型错、重复 id、未知 protocol、契约违约、
+        # 不能聚合 —— 两入口异常类型一致。
+        def cases():
+            yield EmptyBatchError, {}, lambda: StubVerifier()
+
+            bad = proof("p1")
+            del bad["circuit_id"]
+            yield (InvalidProofError,
+                   {"batch_id": "b", "proofs": [bad]},
+                   lambda: StubVerifier())
+            yield (DuplicateProofIdError,
+                   {"batch_id": "b", "proofs": [proof("d"), proof("d")]},
+                   lambda: StubVerifier())
+            yield (UnsupportedProofSystemError,
+                   {"batch_id": "b", "proofs": [proof("p1", proto="mystery")]},
+                   lambda: StubVerifier())
+            yield (VerifierContractError,
+                   {"batch_id": "b", "proofs": [proof("p1", proto="halo2")]},
+                   lambda: IncompleteVerifier())
+            yield (IncompatibleAggregationError,
+                   {"batch_id": "b", "proofs": [proof("p1")]},
+                   lambda: StubVerifier(aggregate_ok=False))
+
+        for error_type, batch, make_verifier in cases():
+            with self.assertRaises(error_type):
+                verify_batch(batch, make_verifier())
+            with self.assertRaises(error_type):
+                verify_batch_detailed(batch, make_verifier())
+
+    def test_to_dict_fixed_key_order(self):
+        v = StubVerifier(agg_verify=False, reject_ids={"p2"})
+        report = verify_batch_detailed(
+            {"batch_id": "B", "proofs": [proof("p1"), proof("p2")]}, v
+        )
+        payload = report.to_dict()
+        self.assertEqual(list(payload), ["result", "groups"])
+        self.assertEqual(
+            list(payload["result"]),
+            ["batch_id", "aggregate_count", "passed", "failed", "failures"],
+        )
+        g = payload["groups"][0]
+        self.assertEqual(
+            list(g),
+            [
+                "group_id",
+                "proof_ids",
+                "aggregate_status",
+                "aggregate_message",
+                "aggregate_verify_status",
+                "aggregate_verify_message",
+                "fell_back",
+                "proofs",
+            ],
+        )
+        self.assertEqual(list(g["proofs"][0]), ["proof_id", "status", "message"])
+        # failures 明细键序沿用 Failure.to_dict
+        self.assertEqual(
+            list(payload["result"]["failures"][0]),
+            ["proof_id", "group_id", "stage", "code", "message"],
+        )
+
+    def test_to_dict_values_match_model(self):
+        v = StubVerifier(agg_verify=False, reject_ids={"p2"}, error_ids={"p3"})
+        batch = {"batch_id": "B",
+                 "proofs": [proof("p1"), proof("p2"), proof("p3")]}
+        report = verify_batch_detailed(batch, v)
+        payload = report.to_dict()
+        g = payload["groups"][0]
+        self.assertEqual(g["group_id"], "groth16:c1:k1")
+        self.assertEqual(g["proof_ids"], ["p1", "p2", "p3"])
+        self.assertEqual(g["fell_back"], True)
+        self.assertEqual(
+            [(d["proof_id"], d["status"]) for d in g["proofs"]],
+            [("p1", "passed"), ("p2", "rejected"), ("p3", "error")],
+        )
+        self.assertEqual(payload["result"]["failed"], 2)
+
+    def test_proof_and_public_inputs_never_in_messages(self):
+        sentinel_inputs = [{"secret": "inputs-should-not-leak"}]
+        sentinel_proof = ("secret-proof-body",)
+
+        class LeakCheck(StubVerifier):
+            def verify_aggregate(self, proofs, aggregated):
+                return False
+
+            def verify(self, p):
+                raise ValueError("boom")
+
+        v = LeakCheck()
+        report = verify_batch_detailed(
+            {"batch_id": "B",
+             "proofs": [proof("p1", inputs=sentinel_inputs, body=sentinel_proof)]},
+            v,
+        )
+        text = repr(report.to_dict())
+        self.assertNotIn("secret-proof-body", text)
+        self.assertNotIn("inputs-should-not-leak", text)
+
+    def test_deterministic_repeated_calls(self):
+        batch = {"batch_id": "B",
+                 "proofs": [proof("z", key="k2"), proof("a", key="k1")]}
+        kw = {"agg_verify": False, "reject_ids": {"z", "a"}}
+        first = verify_batch_detailed(batch, StubVerifier(**kw)).to_dict()
+        second = verify_batch_detailed(batch, StubVerifier(**kw)).to_dict()
+        self.assertEqual(first, second)
 
 
 # ================================================================ 队列

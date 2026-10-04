@@ -25,6 +25,17 @@ STAGES = (
 CODE_REJECTED = "rejected"      # 验证方法返回 False
 CODE_VERIFY_ERROR = "verify_error"  # 验证方法抛出异常
 
+# 详细报告状态
+# 聚合调用：aggregate 成功 / 抛非 IncompatibleAggregationError 异常
+DETAIL_AGG_SUCCEEDED = "succeeded"
+DETAIL_AGG_ERROR = "error"
+# 聚合验证：verify_aggregate 返回 True / 返回 False（rejected）/ 抛异常
+DETAIL_PASSED = "passed"
+DETAIL_REJECTED = "rejected"
+DETAIL_ERROR = "error"
+# 逐证状态：未进入回退
+DETAIL_NOT_RUN = "not_run"
+
 
 @dataclass(frozen=True)
 class Proof:
@@ -147,3 +158,87 @@ class VerificationJob:
     status: str
     result: Any = None  # type: BatchVerificationResult | None
     error: Any = None   # 运行中抛出的异常（作业仍标记 completed？见 queue 说明）
+
+
+# ================================================================ 详细报告
+
+@dataclass(frozen=True)
+class ProofVerificationDetail:
+    """组内单证明的验证明细。
+
+    ``status`` 取值：
+
+    * ``passed`` —— 通过（聚合验证通过时整组逐证同样记 passed）；
+    * ``rejected`` —— 单证验证返回 False，``message`` 固定为
+      "proof rejected by verifier"；
+    * ``error`` —— 单证验证抛异常，``message`` 为「异常类型名: str」；
+    * ``not_run`` —— 未执行到该证明（如聚合调用即失败）。
+
+    ``proof`` 与 ``public_inputs`` 不出现在明细中，也不拼入任何消息。
+    """
+
+    proof_id: str
+    status: str
+    message: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "proof_id": self.proof_id,
+            "status": self.status,
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
+class GroupVerificationReport:
+    """单个聚合组的验证报告；组内顺序一律为批次原序。
+
+    * ``proof_ids`` —— 组内 proof_id，按批次原序；
+    * ``aggregate_status`` —— 聚合调用状态：``succeeded`` / ``error``；
+      抛 IncompatibleAggregationError 时整批抛出、不产生报告；
+    * ``aggregate_message`` —— 聚合异常消息（成功为空串）；
+    * ``aggregate_verify_status`` —— 聚合验证状态：``passed`` /
+      ``rejected`` / ``error``；聚合未执行时为 ``not_run``；
+    * ``fell_back`` —— 是否回退到逐证验证；
+    * ``proofs`` —— 逐证状态与消息，按批次原序。
+    """
+
+    group_id: str
+    proof_ids: List[str]
+    aggregate_status: str
+    aggregate_message: str
+    aggregate_verify_status: str
+    aggregate_verify_message: str
+    fell_back: bool
+    proofs: List[ProofVerificationDetail] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "group_id": self.group_id,
+            "proof_ids": list(self.proof_ids),
+            "aggregate_status": self.aggregate_status,
+            "aggregate_message": self.aggregate_message,
+            "aggregate_verify_status": self.aggregate_verify_status,
+            "aggregate_verify_message": self.aggregate_verify_message,
+            "fell_back": self.fell_back,
+            "proofs": [detail.to_dict() for detail in self.proofs],
+        }
+
+
+@dataclass(frozen=True)
+class BatchVerificationReport:
+    """整批详细报告。
+
+    ``result`` 与同输入下 :func:`verify_batch` 返回的
+    :class:`BatchVerificationResult` 同值；``groups`` 按分组首次出现顺序
+    排列，组内保持批次原序。
+    """
+
+    result: BatchVerificationResult
+    groups: List[GroupVerificationReport] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "result": self.result.to_dict(),
+            "groups": [group.to_dict() for group in self.groups],
+        }
