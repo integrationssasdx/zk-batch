@@ -13,6 +13,8 @@
   UnknownJobError；
 * :meth:`result` 仅 completed 返回 BatchVerificationResult，其余状态抛
   ResultUnavailableError（不存在抛 UnknownJobError）。
+* :meth:`reverify_failures` 依据已完成作业的失败清单派生独立复核作业，
+  只重验失败证明，源作业状态与结果不变。
 
 不持久化、不联网、不使用线程。
 """
@@ -21,12 +23,14 @@ from __future__ import annotations
 
 import itertools
 from collections import OrderedDict
+from collections.abc import Mapping
 from typing import Any, Dict, Optional
 
 from .engine import verify_batch
 from .errors import (
     CancelledJobError,
     CompletedJobError,
+    NoFailedProofError,
     ResultUnavailableError,
     RunningJobError,
     UnknownJobError,
@@ -122,6 +126,35 @@ class VerificationQueue:
                 f"job {job_id!r} has no result (status={job.status!r})"
             )
         return job.result  # type: ignore[return-value]
+
+    # ---------------------------------------------------------------- 复核
+
+    def reverify_failures(self, job_id: str, verifiers: Any = None) -> str:
+        """为已完成作业的失败证明派生复核作业，返回新 ``job_id``。
+
+        只把源结果 ``failures`` 中的证明按原批次相对顺序重新入队，
+        ``batch_id`` 不变，``public_inputs``/``proof`` 原样传递；源作业
+        的状态与结果不受影响。新作业是普通 queued 作业，照常走
+        run_next / cancel / status / result。``verifiers`` 只作用于
+        新作业，省略时使用队列默认验证器。
+
+        * 源作业不存在 —— UnknownJobError；
+        * 源作业不是 completed —— ResultUnavailableError；
+        * 源结果没有失败证明 —— NoFailedProofError。
+        """
+        # result() 自带 UnknownJobError / ResultUnavailableError 语义
+        result = self.result(job_id)
+        failed_ids = {f.proof_id for f in result.failures}
+        if not failed_ids:
+            raise NoFailedProofError(f"job {job_id!r} has no failed proofs")
+        batch = self._jobs[job_id].batch
+        selected = [
+            raw
+            for raw in batch["proofs"]
+            if isinstance(raw, Mapping) and raw.get("proof_id") in failed_ids
+        ]
+        new_batch = {"batch_id": batch["batch_id"], "proofs": selected}
+        return self.enqueue(new_batch, verifiers=verifiers)
 
     # ---------------------------------------------------------------- 内部
 

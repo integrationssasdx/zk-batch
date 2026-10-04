@@ -16,6 +16,7 @@ from zk_batch import (  # noqa: E402
     EmptyBatchError,
     IncompatibleAggregationError,
     InvalidProofError,
+    NoFailedProofError,
     ResultUnavailableError,
     RunningJobError,
     UnknownJobError,
@@ -490,6 +491,144 @@ class TestQueue(unittest.TestCase):
             {k for k in payload["failures"][0]},
             {"proof_id", "group_id", "stage", "code", "message"},
         )
+
+
+# ================================================================ 复核
+
+class TestReverifyFailures(unittest.TestCase):
+    def make_source(self, verifier=None, proofs=None, batch_id="B"):
+        """入队并执行一个源作业，返回 (queue, job_id, result)。"""
+        q = VerificationQueue(verifier or StubVerifier())
+        job_id = q.enqueue(
+            {"batch_id": batch_id, "proofs": proofs or [proof("p1")]}
+        )
+        result = q.run_next()
+        return q, job_id, result
+
+    def test_unknown_source(self):
+        q = VerificationQueue(StubVerifier())
+        with self.assertRaises(UnknownJobError):
+            q.reverify_failures("ghost")
+
+    def test_unfinished_source(self):
+        q = VerificationQueue(StubVerifier())
+        queued = q.enqueue({"batch_id": "B", "proofs": [proof("p1")]})
+        with self.assertRaises(ResultUnavailableError):
+            q.reverify_failures(queued)
+        q.cancel(queued)
+        with self.assertRaises(ResultUnavailableError):
+            q.reverify_failures(queued)
+
+    def test_no_failures_raises(self):
+        q, src, result = self.make_source()
+        self.assertEqual(result.failures, [])
+        with self.assertRaises(NoFailedProofError):
+            q.reverify_failures(src)
+
+    def test_only_failed_proofs_reverified_in_original_order(self):
+        v = StubVerifier(agg_verify=False, reject_ids={"z", "a", "m"})
+        q, src, _ = self.make_source(
+            verifier=v,
+            proofs=[proof("z"), proof("a"), proof("m"), proof("ok")],
+        )
+        # ok 也通过？agg_verify=False 全组回退，ok 单证通过，故失败为 z/a/m
+        reverify_v = StubVerifier(agg_verify=False)
+        new_job = q.reverify_failures(src, verifiers=reverify_v)
+        self.assertNotEqual(new_job, src)
+        self.assertEqual(q.status(new_job), "queued")
+        result = q.run_next()
+        # 复核批次只有三张失败证明，且按原批次相对顺序逐证验证
+        self.assertEqual(reverify_v.calls["verify"], ["z", "a", "m"])
+        self.assertEqual(result.passed + result.failed, 3)
+        self.assertEqual(result.aggregate_count, 1)
+
+    def test_source_job_untouched(self):
+        v = StubVerifier(agg_verify=False, reject_ids={"p1"})
+        q, src, src_result = self.make_source(verifier=v)
+        new_job = q.reverify_failures(src)
+        self.assertEqual(q.status(src), "completed")
+        self.assertIs(q.result(src), src_result)
+        # 新作业是独立 queued 作业，可取消
+        self.assertTrue(q.cancel(new_job))
+        self.assertEqual(q.status(new_job), "cancelled")
+        self.assertEqual(q.status(src), "completed")
+
+    def test_batch_id_and_payload_preserved(self):
+        sentinel_inputs = [{"x": 1}, [1, 2, 3]]
+        sentinel_proof = object()
+        v = StubVerifier(agg_verify=False, reject_ids={"p1"})
+        q, src, _ = self.make_source(
+            verifier=v,
+            proofs=[proof("p1", inputs=sentinel_inputs, body=sentinel_proof)],
+            batch_id=99,
+        )
+        seen = {}
+
+        class Capturing(StubVerifier):
+            def aggregate(self, proofs):
+                for p in proofs:
+                    seen[p.proof_id] = p
+                return ["AGG"]
+
+        q.reverify_failures(src, verifiers=Capturing())
+        result = q.run_next()
+        self.assertEqual(result.batch_id, 99)
+        self.assertIs(seen["p1"].public_inputs, sentinel_inputs)
+        self.assertIs(seen["p1"].proof, sentinel_proof)
+
+    def test_regrouping_and_failure_payload(self):
+        v = StubVerifier(agg_verify=False, reject_ids={"p2"}, error_ids={"p3"})
+        proofs = [
+            proof("p1", key="k1"),
+            proof("p2", key="k2"),
+            proof("p3", key="k1"),
+        ]
+        q, src, src_result = self.make_source(verifier=v, proofs=proofs)
+        self.assertEqual({f.proof_id for f in src_result.failures}, {"p2", "p3"})
+
+        reverify_v = StubVerifier(agg_verify=False,
+                                  reject_ids={"p2"}, error_ids={"p3"})
+        q.reverify_failures(src, verifiers=reverify_v)
+        result = q.run_next()
+        # 复核证明重新分组：p2 在 k2 组，p3 在 k1 组
+        self.assertEqual(result.aggregate_count, 2)
+        self.assertEqual(result.passed + result.failed, 2)
+        self.assertEqual([f.proof_id for f in result.failures], ["p2", "p3"])
+        by_id = {f.proof_id: f for f in result.failures}
+        self.assertEqual(by_id["p2"].code, "rejected")
+        self.assertEqual(by_id["p2"].stage, "single_verify")
+        self.assertEqual(by_id["p2"].group_id, "groth16:c1:k2")
+        self.assertEqual(by_id["p3"].code, "verify_error")
+        self.assertEqual(by_id["p3"].group_id, "groth16:c1:k1")
+
+    def test_default_verifiers_used_when_not_overridden(self):
+        # 队列默认验证器拒绝 p1；复核不传 verifiers 时沿用默认值
+        v = StubVerifier(agg_verify=False, reject_ids={"p1"})
+        q, src, _ = self.make_source(verifier=v)
+        q.reverify_failures(src)
+        result = q.run_next()
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(result.failures[0].proof_id, "p1")
+
+    def test_override_scoped_to_new_job(self):
+        v = StubVerifier(agg_verify=False, reject_ids={"p1"})
+        q, src, _ = self.make_source(verifier=v)
+        # 覆盖为只认识 plonk 的验证器 -> 复核作业里 groth16 未知
+        q.reverify_failures(src, verifiers=OtherVerifier())
+        with self.assertRaises(UnsupportedProofSystemError):
+            q.run_next()
+        # 源作业不受影响
+        self.assertEqual(q.status(src), "completed")
+
+    def test_engine_errors_preserved_on_reverify(self):
+        v = StubVerifier(agg_verify=False, reject_ids={"p1", "p2"})
+        q, src, _ = self.make_source(
+            verifier=v, proofs=[proof("p1"), proof("p2")]
+        )
+        # 复核批次聚合不兼容：异常类型原样传播
+        q.reverify_failures(src, verifiers=StubVerifier(aggregate_ok=False))
+        with self.assertRaises(IncompatibleAggregationError):
+            q.run_next()
 
 
 if __name__ == "__main__":
