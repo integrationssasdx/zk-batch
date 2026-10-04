@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 
 # 分组键：protocol / circuit_id / aggregation_key
@@ -222,3 +222,163 @@ class VerificationJob:
     status: str
     result: Any = None  # type: BatchVerificationResult | None
     error: Any = None   # 运行中抛出的异常（作业仍标记 completed？见 queue 说明）
+
+
+# ============================================ 排队逐项验证（任务流程）模型
+
+# 单项结论
+ITEM_PASSED = "passed"
+ITEM_FAILED = "failed"
+
+# 单项失败阶段（逐项验证只暴露单证验证这一个公开阶段）
+ITEM_STAGE_VERIFY = "verify"
+
+# 单项错误码：稳定可比较；验证方法返回 False / 抛异常两类，
+# 与既有引擎的 rejected / verify_error 口径一致。
+ITEM_CODE_REJECTED = "rejected"
+ITEM_CODE_VERIFY_ERROR = "verify_error"
+
+
+@dataclass(frozen=True)
+class ItemResult:
+    """单个验证项的结果；与提交顺序一致（index 为 0 基输入序号）。
+
+    定位信息固定为 ``index``/``item_id``/``stage``/``code``/``message``：
+    通过项 ``stage`` 与 ``code`` 为空串。任何字段都不包含证明材料、
+    内部调用栈或未公开验证器信息。
+    """
+
+    index: int
+    item_id: str
+    passed: bool
+    stage: str = ""
+    code: str = ""
+    message: str = ""
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "item_id": self.item_id,
+            "passed": self.passed,
+            "stage": self.stage,
+            "code": self.code,
+            "message": self.message,
+        }
+
+
+@dataclass(frozen=True)
+class ItemBatchResult:
+    """一个任务的整批逐项结果（终态可取）。
+
+    ``results`` 严格按输入顺序排列；``failed_item_ids`` 为失败项
+    标识，同样按输入顺序（稳定、可复现）。
+    """
+
+    task_id: str
+    total: int
+    passed_count: int
+    failed_count: int
+    results: List[ItemResult] = field(default_factory=list)
+    failed_item_ids: List[str] = field(default_factory=list)
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "total": self.total,
+            "passed_count": self.passed_count,
+            "failed_count": self.failed_count,
+            "results": [r.to_dict() for r in self.results],
+            "failed_item_ids": list(self.failed_item_ids),
+        }
+
+
+@dataclass(frozen=True)
+class BatchSummary:
+    """提交成功后随回执返回的当前批次摘要（提交期即可确定，不含结果）。"""
+
+    total: int
+    item_ids: List[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "total": self.total,
+            "item_ids": list(self.item_ids),
+        }
+
+
+@dataclass(frozen=True)
+class TaskReceipt:
+    """提交成功的回执：稳定任务标识、排队状态与批次摘要。"""
+
+    task_id: str
+    status: str
+    summary: BatchSummary
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "status": self.status,
+            "summary": self.summary.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class TaskProgress:
+    """任务的实时进度。
+
+    ``completed`` 为已经得出结论（通过或失败）的验证项数；
+    ``total`` 为整批项数。任务结束前查询不给出最终结果。
+    """
+
+    task_id: str
+    status: str
+    total: int
+    completed: int
+
+    @property
+    def remaining(self) -> int:
+        return self.total - self.completed
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "status": self.status,
+            "total": self.total,
+            "completed": self.completed,
+            "remaining": self.remaining,
+        }
+
+
+@dataclass(frozen=True)
+class TaskSnapshot:
+    """任务查询快照（统一查询入口的返回值）。
+
+    * 任务未结束（queued/processing）或因基础设施故障停在 failed 时：
+      ``result`` 为 ``None``（不提前给出最终聚合结果），``items`` 给出
+      已完成项的逐条结论（输入顺序），``completed`` 为真实完成进度；
+    * 任务 completed：``result`` 为稳定的 :class:`ItemBatchResult`，
+      ``items`` 与其 ``results`` 同值同序。
+
+    快照为只读视图：查询不调用验证器、不改变任务状态；终态后重复查询
+    返回同一结果对象。
+    """
+
+    task_id: str
+    status: str
+    total: int
+    completed: int
+    items: List["ItemResult"] = field(default_factory=list)
+    result: Optional["ItemBatchResult"] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "status": self.status,
+            "total": self.total,
+            "completed": self.completed,
+            "remaining": self.total - self.completed,
+            "result": self.result.to_dict() if self.result is not None else None,
+            "items": [r.to_dict() for r in self.items],
+        }
+
+
