@@ -130,6 +130,15 @@ class NoRetryableItemsError(TaskError):
     """
 
 
+class TaskLineageMismatchError(TaskError):
+    """复核任务不是源任务的直接 ``retry_failed`` 任务。
+
+    对账时要求复核任务确由该源任务直接复核生成；与
+    :class:`TaskNotFoundError`（任务不存在）和
+    :class:`TaskStateConflictError`（任务未终结）互不替代。
+    """
+
+
 class VerificationInfrastructureError(TaskError):
     """基础设施失败：无法读取证明材料、验证器执行失败或无法保存最终结果。
 

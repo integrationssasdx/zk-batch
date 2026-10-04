@@ -25,6 +25,10 @@
 * :meth:`retry_failed` 从 completed/failed 源任务挑出待复核项，按根任务
   输入顺序创建独立的 queued 任务（新任务标识，``ItemResult.index`` 保留
   根任务下标）；源任务的状态、结果与错误定位不受影响。
+* :meth:`retry_outcome` 只读对账复核结果：比对源任务与直接复核任务的
+  终态结果，按根任务输入顺序给出每项复核前后的状态与唯一结论
+  （recovered / still_failed / still_unresolved）。不调用验证器、不
+  创建任务、不改变任何状态或结果，重复查询结果一致。
 
 不持久化、不联网、不使用线程。失败定位只含输入序号、项标识、失败阶段、
 稳定错误码与供人工定位的描述，绝不包含完整证明材料、内部调用栈或未公开
@@ -52,6 +56,7 @@ from .errors import (
     InvalidItemIdError,
     InvalidProofFormatError,
     NoRetryableItemsError,
+    TaskLineageMismatchError,
     TaskNotFoundError,
     TaskStateConflictError,
     VerificationInfrastructureError,
@@ -67,7 +72,11 @@ from .models import (
     ITEM_PASSED,
     ITEM_STAGE_PROOF_READ,
     ITEM_STAGE_VERIFY,
+    ITEM_UNRESOLVED,
     MAX_BATCH_ITEMS,
+    OUTCOME_RECOVERED,
+    OUTCOME_STILL_FAILED,
+    OUTCOME_STILL_UNRESOLVED,
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_PROCESSING,
@@ -77,6 +86,8 @@ from .models import (
     BatchTaskResult,
     ItemResult,
     Proof,
+    RetryOutcomeItem,
+    RetryOutcomeReport,
     TaskProgress,
     TaskRetrySubmission,
     TaskSubmission,
@@ -101,7 +112,8 @@ class _TaskRecord:
     """队列内部的任务记录（不对外暴露）。"""
 
     def __init__(self, task_id: str, items: List[dict], verifiers: Any,
-                 indexes: Optional[List[int]] = None):
+                 indexes: Optional[List[int]] = None,
+                 retried_from: Optional[str] = None):
         self.task_id = task_id
         self.items = items
         self.verifiers = verifiers
@@ -111,6 +123,9 @@ class _TaskRecord:
             list(indexes) if indexes is not None
             else list(range(len(items)))
         )
+        # 直接复核来源：retry_failed 创建的任务记录源任务标识，普通提交
+        # 为 None；仅供 retry_outcome 校验任务血缘。
+        self.retried_from = retried_from
         self.status: str = TASK_QUEUED
         self.total: int = len(items)
         self.results: List[ItemResult] = []
@@ -215,7 +230,8 @@ class VerificationTaskQueue:
         items = [record.items[positions[index]] for index in selected]
         new_task_id = f"task-{next(self._counter)}"
         self._tasks[new_task_id] = _TaskRecord(
-            new_task_id, items, chosen, indexes=selected
+            new_task_id, items, chosen, indexes=selected,
+            retried_from=task_id,
         )
         return TaskRetrySubmission(
             source_task_id=task_id,
@@ -227,6 +243,51 @@ class VerificationTaskQueue:
             ),
             retried_indexes=list(selected),
         )
+
+    def retry_outcome(
+        self, source_task_id: str, retry_task_id: str
+    ) -> RetryOutcomeReport:
+        """只读对账 ``retry_failed`` 的复核结果，返回
+        :class:`RetryOutcomeReport`。
+
+        对账范围严格沿用 ``retry_failed`` 的选取（即复核任务实际验证的
+        项，按根任务输入顺序）：源任务为 completed 时只含失败项；为
+        failed 时含错误项及其后尚无结果的项并入已有失败项。每项给出
+        复核前后定位与唯一结论：
+
+        * ``before_status`` 只取 ``failed``/``unresolved``——源任务中的
+          失败项取 ``failed``，错误项及其后无结果项取 ``unresolved``；
+        * ``after_status`` 只取 ``passed``/``failed``/``unresolved``，
+          分别记结论 ``recovered``/``still_failed``/``still_unresolved``；
+        * ``stage``/``code``/``message`` 沿用对应任务已有的定位（有结果
+          的项取 :class:`ItemResult` 字段，无结果的项沿用该任务保留的
+          基础设施错误定位）；未入选项不进入明细。
+
+        本方法不调用验证器、不创建任务、不改变任何任务的状态或结果，
+        重复查询返回一致内容；报告只含定位信息，不含证明材料、
+        ``public_inputs``、调用栈或未公开验证器信息。
+
+        * 任一任务不存在 ——:class:`TaskNotFoundError`；
+        * 任一任务未终结（queued/processing）——:class:`TaskStateConflictError`；
+        * 复核任务不是源任务的直接 ``retry_failed`` 任务
+          ——:class:`TaskLineageMismatchError`。
+
+        三类异常互不替代，按上述顺序依次检查。
+        """
+        source = self._require_task(source_task_id)
+        retry = self._require_task(retry_task_id)
+        for record in (source, retry):
+            if record.status not in TASK_TERMINAL_STATUSES:
+                raise TaskStateConflictError(
+                    f"task {record.task_id!r} is not terminal "
+                    f"(status={record.status!r})"
+                )
+        if retry.retried_from != source_task_id:
+            raise TaskLineageMismatchError(
+                f"task {retry_task_id!r} is not a direct retry_failed "
+                f"task of {source_task_id!r}"
+            )
+        return _build_retry_outcome(source, retry)
 
     # --------------------------------------------------------------- 消费
 
@@ -493,6 +554,106 @@ def _select_retry_indexes(record: _TaskRecord) -> List[int]:
         if index >= start and index not in done
     }
     return sorted(failed | pending)
+
+
+# ============================================================ 复核对账
+
+def _error_location(error: Optional[VerificationInfrastructureError]):
+    """任务级基础设施错误的定位三元组；无错误时为空串。"""
+    if error is None:
+        return "", "", ""
+    return (
+        error.stage or "",
+        error.code or "",
+        str(error),
+    )
+
+
+def _build_retry_outcome(
+    source: _TaskRecord, retry: _TaskRecord
+) -> RetryOutcomeReport:
+    """比对源任务与其直接复核任务的终态结果，生成对账报告（纯只读）。
+
+    明细范围即复核任务实际验证的项（``retry.indexes``，按根任务输入
+    顺序）；前后定位分别取自源任务与复核任务已保存的结果/错误。
+    """
+    source_results = {r.index: r for r in source.results}
+    retry_results = {r.index: r for r in retry.results}
+
+    items: List[RetryOutcomeItem] = []
+    recovered_ids: List[str] = []
+    still_failed_ids: List[str] = []
+    unresolved_ids: List[str] = []
+
+    for position, index in enumerate(retry.indexes):
+        item_id = retry.items[position]["item_id"]
+
+        before = source_results.get(index)
+        if before is not None and before.status == ITEM_FAILED:
+            before_status = ITEM_FAILED
+            before_stage = before.stage
+            before_code = before.code
+            before_message = before.message
+        else:
+            # 错误项及其后无结果项：沿用源任务保留的错误定位
+            before_status = ITEM_UNRESOLVED
+            before_stage, before_code, before_message = _error_location(
+                source.error
+            )
+
+        after = retry_results.get(index)
+        if after is not None:
+            after_status = after.status
+            after_stage = after.stage
+            after_code = after.code
+            after_message = after.message
+        else:
+            # 复核任务自身失败、该项尚无结果：沿用复核任务的错误定位
+            after_status = ITEM_UNRESOLVED
+            after_stage, after_code, after_message = _error_location(
+                retry.error
+            )
+
+        if after_status == ITEM_PASSED:
+            outcome = OUTCOME_RECOVERED
+            recovered_ids.append(item_id)
+        elif after_status == ITEM_FAILED:
+            outcome = OUTCOME_STILL_FAILED
+            still_failed_ids.append(item_id)
+        else:
+            outcome = OUTCOME_STILL_UNRESOLVED
+            unresolved_ids.append(item_id)
+
+        items.append(
+            RetryOutcomeItem(
+                index=index,
+                item_id=item_id,
+                before_status=before_status,
+                before_stage=before_stage,
+                before_code=before_code,
+                before_message=before_message,
+                after_status=after_status,
+                after_stage=after_stage,
+                after_code=after_code,
+                after_message=after_message,
+                outcome=outcome,
+            )
+        )
+
+    return RetryOutcomeReport(
+        source_task_id=source.task_id,
+        retry_task_id=retry.task_id,
+        source_status=source.status,
+        retry_status=retry.status,
+        retried_indexes=list(retry.indexes),
+        items=items,
+        recovered_item_ids=recovered_ids,
+        still_failed_item_ids=still_failed_ids,
+        unresolved_item_ids=unresolved_ids,
+        recovered_count=len(recovered_ids),
+        still_failed_count=len(still_failed_ids),
+        unresolved_count=len(unresolved_ids),
+    )
 
 
 # ============================================================ 提交前校验

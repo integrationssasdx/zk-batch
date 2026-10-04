@@ -380,3 +380,93 @@ class TaskProgress:
             "completed": self.completed,
             "result": None if self.result is None else self.result.to_dict(),
         }
+
+
+# ============================================================ 复核对账
+
+# 对账前后可能出现的结果之外的状态：入选项在该次验证中尚无结果
+ITEM_UNRESOLVED = "unresolved"
+
+# 复核项的唯一结论
+OUTCOME_RECOVERED = "recovered"              # 复核后通过
+OUTCOME_STILL_FAILED = "still_failed"        # 复核后仍失败
+OUTCOME_STILL_UNRESOLVED = "still_unresolved"  # 复核后仍无结果
+
+
+@dataclass(frozen=True)
+class RetryOutcomeItem:
+    """单个复核项的对账明细。
+
+    ``index`` 为根任务输入的零起下标；``before_*`` 取自源任务、
+    ``after_*`` 取自复核任务（``status`` 只取 ``passed``/``failed``/
+    ``unresolved``）；``outcome`` 为该项唯一结论（``recovered`` /
+    ``still_failed`` / ``still_unresolved``）。只承载定位信息，不含
+    证明材料、调用栈或未公开验证器信息。
+    """
+
+    index: int
+    item_id: str
+    before_status: str
+    before_stage: str
+    before_code: str
+    before_message: str
+    after_status: str
+    after_stage: str
+    after_code: str
+    after_message: str
+    outcome: str
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "item_id": self.item_id,
+            "before_status": self.before_status,
+            "before_stage": self.before_stage,
+            "before_code": self.before_code,
+            "before_message": self.before_message,
+            "after_status": self.after_status,
+            "after_stage": self.after_stage,
+            "after_code": self.after_code,
+            "after_message": self.after_message,
+            "outcome": self.outcome,
+        }
+
+
+@dataclass(frozen=True)
+class RetryOutcomeReport:
+    """``retry_failed`` 复核结果的只读对账报告。
+
+    ``retried_indexes`` 与 ``items`` 均按根任务输入顺序排列；
+    ``recovered_item_ids``/``still_failed_item_ids``/``unresolved_item_ids``
+    按结论归类、各自保持根任务输入顺序；三个 ``*_count`` 为对应归类的
+    数量。只承载定位信息，不含证明材料、调用栈或未公开验证器信息。
+    """
+
+    source_task_id: str
+    retry_task_id: str
+    source_status: str
+    retry_status: str
+    retried_indexes: List[int]
+    items: List[RetryOutcomeItem]
+    recovered_item_ids: List[str]
+    still_failed_item_ids: List[str]
+    unresolved_item_ids: List[str]
+    recovered_count: int
+    still_failed_count: int
+    unresolved_count: int
+
+    def to_dict(self) -> dict:
+        return {
+            "source_task_id": self.source_task_id,
+            "retry_task_id": self.retry_task_id,
+            "source_status": self.source_status,
+            "retry_status": self.retry_status,
+            "retried_indexes": list(self.retried_indexes),
+            "items": [item.to_dict() for item in self.items],
+            "recovered_item_ids": list(self.recovered_item_ids),
+            "still_failed_item_ids": list(self.still_failed_item_ids),
+            "unresolved_item_ids": list(self.unresolved_item_ids),
+            "recovered_count": self.recovered_count,
+            "still_failed_count": self.still_failed_count,
+            "unresolved_count": self.unresolved_count,
+        }

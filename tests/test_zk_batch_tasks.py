@@ -18,7 +18,12 @@
 * 复核：retry_failed 从 completed/failed 源任务选取待复核项（失败项、
   错误项及其后无结果项，按根任务输入顺序去重），生成独立 queued 任务，
   ItemResult.index 保留根任务下标；NoRetryableItemsError /
-  TaskNotFoundError / TaskStateConflictError 互不替代。
+  TaskNotFoundError / TaskStateConflictError 互不替代；
+* 复核对账：retry_outcome 只读比对源任务与直接复核任务的终态结果，
+  按根任务顺序给出每项 before/after 状态与唯一结论（recovered /
+  still_failed / still_unresolved）、归类 item_ids 与计数；固定键序
+  to_dict；TaskNotFoundError / TaskStateConflictError /
+  TaskLineageMismatchError 互不替代；查询幂等且不泄露证明材料。
 
 直接运行：python tests/test_zk_batch_tasks.py
 """
@@ -38,6 +43,8 @@ from zk_batch import (  # noqa: E402
     ItemResult,
     MAX_BATCH_ITEMS,
     NoRetryableItemsError,
+    RetryOutcomeReport,
+    TaskLineageMismatchError,
     TaskNotFoundError,
     TaskProgress,
     TaskRetrySubmission,
@@ -840,6 +847,253 @@ class TestRetryFailed(unittest.TestCase):
         # 复核任务先入队，run_next 按 FIFO 消费
         self.assertEqual(q.run_next().task_id, receipt.task_id)
         self.assertEqual(q.run_next().task_id, other)
+
+
+# ================================================================ 复核对账
+
+class TestRetryOutcome(unittest.TestCase):
+    def test_completed_source_all_recovered(self):
+        v = StubVerifier(reject_ids={"p2", "p4"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit(
+            [item("p1"), item("p2"), item("p3"), item("p4")]
+        ).task_id
+        q.run_next()
+        receipt = q.retry_failed(tid, verifiers=StubVerifier())
+        q.run_task(receipt.task_id)
+
+        report = q.retry_outcome(tid, receipt.task_id)
+        self.assertIsInstance(report, RetryOutcomeReport)
+        self.assertEqual(report.source_task_id, tid)
+        self.assertEqual(report.retry_task_id, receipt.task_id)
+        self.assertEqual(report.source_status, "completed")
+        self.assertEqual(report.retry_status, "completed")
+        self.assertEqual(report.retried_indexes, [1, 3])
+        self.assertEqual(report.recovered_item_ids, ["p2", "p4"])
+        self.assertEqual(report.still_failed_item_ids, [])
+        self.assertEqual(report.unresolved_item_ids, [])
+        self.assertEqual(
+            (report.recovered_count, report.still_failed_count,
+             report.unresolved_count),
+            (2, 0, 0),
+        )
+        # 明细按根任务顺序；复核前 failed、复核后 passed -> recovered
+        self.assertEqual(
+            [(i.index, i.item_id, i.before_status, i.after_status, i.outcome)
+             for i in report.items],
+            [(1, "p2", "failed", "passed", "recovered"),
+             (3, "p4", "failed", "passed", "recovered")],
+        )
+        first = report.items[0]
+        self.assertEqual(
+            (first.before_stage, first.before_code, first.before_message),
+            ("verify", "rejected", "proof rejected by verifier"),
+        )
+        self.assertEqual(
+            (first.after_stage, first.after_code, first.after_message),
+            ("", "", ""),
+        )
+        # to_dict 固定键序（报告与明细）
+        self.assertEqual(
+            list(report.to_dict()),
+            ["source_task_id", "retry_task_id", "source_status",
+             "retry_status", "retried_indexes", "items",
+             "recovered_item_ids", "still_failed_item_ids",
+             "unresolved_item_ids", "recovered_count",
+             "still_failed_count", "unresolved_count"],
+        )
+        self.assertEqual(
+            list(first.to_dict()),
+            ["index", "item_id", "before_status", "before_stage",
+             "before_code", "before_message", "after_status",
+             "after_stage", "after_code", "after_message", "outcome"],
+        )
+        self.assertEqual(
+            report.to_dict()["items"][0],
+            {
+                "index": 1,
+                "item_id": "p2",
+                "before_status": "failed",
+                "before_stage": "verify",
+                "before_code": "rejected",
+                "before_message": "proof rejected by verifier",
+                "after_status": "passed",
+                "after_stage": "",
+                "after_code": "",
+                "after_message": "",
+                "outcome": "recovered",
+            },
+        )
+
+    def test_failed_source_unresolved_before_and_mixed_outcome(self):
+        v = StubVerifier(reject_ids={"p2"}, error_ids={"p4"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit(
+            [item("p1"), item("p2"), item("p3"), item("p4"), item("p5")]
+        ).task_id
+        with self.assertRaises(VerificationInfrastructureError):
+            q.run_next()
+        receipt = q.retry_failed(
+            tid, verifiers=StubVerifier(reject_ids={"p4"})
+        )
+        q.run_task(receipt.task_id)
+
+        report = q.retry_outcome(tid, receipt.task_id)
+        self.assertEqual(report.source_status, "failed")
+        self.assertEqual(report.retry_status, "completed")
+        self.assertEqual(report.retried_indexes, [1, 3, 4])
+        # 失败项 before=failed；错误项及其后无结果项 before=unresolved
+        self.assertEqual(
+            [(i.index, i.item_id, i.before_status, i.after_status, i.outcome)
+             for i in report.items],
+            [(1, "p2", "failed", "passed", "recovered"),
+             (3, "p4", "unresolved", "failed", "still_failed"),
+             (4, "p5", "unresolved", "passed", "recovered")],
+        )
+        # unresolved 项沿用源任务保留的错误定位
+        err = q.task_error(tid)
+        for i in report.items[1:]:
+            self.assertEqual(
+                (i.before_stage, i.before_code, i.before_message),
+                (err.stage, err.code, str(err)),
+            )
+        # still_failed 项沿用复核任务 ItemResult 的定位
+        still = report.items[1]
+        self.assertEqual(
+            (still.after_stage, still.after_code, still.after_message),
+            ("verify", "rejected", "proof rejected by verifier"),
+        )
+        # item_ids 按 outcome 归类、各自保持根任务顺序
+        self.assertEqual(report.recovered_item_ids, ["p2", "p5"])
+        self.assertEqual(report.still_failed_item_ids, ["p4"])
+        self.assertEqual(report.unresolved_item_ids, [])
+        self.assertEqual(
+            (report.recovered_count, report.still_failed_count,
+             report.unresolved_count),
+            (2, 1, 0),
+        )
+
+    def test_retry_task_failed_leaves_still_unresolved(self):
+        v = StubVerifier(reject_ids={"p2"}, error_ids={"p4"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit(
+            [item("p1"), item("p2"), item("p3"), item("p4"), item("p5")]
+        ).task_id
+        with self.assertRaises(VerificationInfrastructureError):
+            q.run_next()
+        # 复核任务继承源验证器，仍在 p4 上出错：p4/p5 复核后仍无结果
+        receipt = q.retry_failed(tid)
+        with self.assertRaises(VerificationInfrastructureError):
+            q.run_task(receipt.task_id)
+
+        report = q.retry_outcome(tid, receipt.task_id)
+        self.assertEqual(report.retry_status, "failed")
+        # 继承的源验证器仍拒绝 p2、在 p4 上出错：p2 仍失败，p4/p5 无结果
+        self.assertEqual(
+            [(i.item_id, i.after_status, i.outcome) for i in report.items],
+            [("p2", "failed", "still_failed"),
+             ("p4", "unresolved", "still_unresolved"),
+             ("p5", "unresolved", "still_unresolved")],
+        )
+        # 复核后无结果的项沿用复核任务的错误定位
+        retry_err = q.task_error(receipt.task_id)
+        for i in report.items[1:]:
+            self.assertEqual(
+                (i.after_stage, i.after_code, i.after_message),
+                (retry_err.stage, retry_err.code, str(retry_err)),
+            )
+        self.assertEqual(report.recovered_item_ids, [])
+        self.assertEqual(report.still_failed_item_ids, ["p2"])
+        self.assertEqual(report.unresolved_item_ids, ["p4", "p5"])
+        self.assertEqual(
+            (report.recovered_count, report.still_failed_count,
+             report.unresolved_count),
+            (0, 1, 2),
+        )
+
+    def test_unknown_task(self):
+        q = VerificationTaskQueue(StubVerifier(reject_ids={"p2"}))
+        tid = q.submit([item("p1"), item("p2")]).task_id
+        q.run_next()
+        receipt = q.retry_failed(tid)
+        q.run_task(receipt.task_id)
+        with self.assertRaises(TaskNotFoundError):
+            q.retry_outcome("ghost", receipt.task_id)
+        with self.assertRaises(TaskNotFoundError):
+            q.retry_outcome(tid, "ghost")
+
+    def test_not_terminal_raises_state_conflict(self):
+        v = StubVerifier(reject_ids={"p1"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("p1")]).task_id
+        # 源任务未终结
+        with self.assertRaises(TaskStateConflictError):
+            q.retry_outcome(tid, tid)
+        q.run_next()
+        # 复核任务未终结（先生成复核任务但不消费）
+        receipt = q.retry_failed(tid)
+        with self.assertRaises(TaskStateConflictError):
+            q.retry_outcome(tid, receipt.task_id)
+
+    def test_lineage_mismatch(self):
+        v = StubVerifier(reject_ids={"p1", "x1"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("p1")]).task_id
+        other = q.submit([item("x1")]).task_id
+        q.run_next()
+        q.run_next()
+        # 普通提交的任务不是任何任务的复核任务
+        with self.assertRaises(TaskLineageMismatchError):
+            q.retry_outcome(tid, other)
+        # 别的任务的复核任务
+        other_retry = q.retry_failed(other, verifiers=StubVerifier())
+        q.run_task(other_retry.task_id)
+        with self.assertRaises(TaskLineageMismatchError):
+            q.retry_outcome(tid, other_retry.task_id)
+        # 间接血缘：retry 的 retry 不是源任务的直接复核任务
+        first = q.retry_failed(tid, verifiers=StubVerifier(
+            reject_ids={"p1"}))
+        q.run_task(first.task_id)
+        second = q.retry_failed(first.task_id, verifiers=StubVerifier())
+        q.run_task(second.task_id)
+        with self.assertRaises(TaskLineageMismatchError):
+            q.retry_outcome(tid, second.task_id)
+        # 直接血缘可对账
+        direct = q.retry_outcome(first.task_id, second.task_id)
+        self.assertEqual(direct.source_task_id, first.task_id)
+        self.assertEqual(direct.retry_task_id, second.task_id)
+
+    def test_read_only_and_idempotent(self):
+        v = StubVerifier(reject_ids={"p2"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("p1"), item("p2")]).task_id
+        q.run_next()
+        pass_v = StubVerifier()
+        receipt = q.retry_failed(tid, verifiers=pass_v)
+        q.run_task(receipt.task_id)
+        verified_before = list(pass_v.verified)
+
+        r1 = q.retry_outcome(tid, receipt.task_id)
+        r2 = q.retry_outcome(tid, receipt.task_id)
+        # 重复查询内容一致
+        self.assertEqual(r1.to_dict(), r2.to_dict())
+        # 不再次调用验证器、不改变状态或结果、不创建任务
+        self.assertEqual(pass_v.verified, verified_before)
+        self.assertEqual(q.status(tid), "completed")
+        self.assertEqual(q.status(receipt.task_id), "completed")
+        self.assertIsNone(q.run_next())
+
+    def test_report_contains_no_proof_material(self):
+        v = StubVerifier(reject_ids={"p2"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("p1"), item("p2")]).task_id
+        q.run_next()
+        receipt = q.retry_failed(tid, verifiers=StubVerifier())
+        q.run_task(receipt.task_id)
+        text = repr(q.retry_outcome(tid, receipt.task_id).to_dict())
+        self.assertNotIn("blob", text)
+        self.assertNotIn("public_inputs", text)
+        self.assertNotIn("Verifier", text)
 
 
 if __name__ == "__main__":

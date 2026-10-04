@@ -85,6 +85,24 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     作用于新任务，省略时继承源任务的验证器选择。无可复核项抛
     `NoRetryableItemsError`，未知任务抛 `TaskNotFoundError`，queued 或
     processing 源任务抛 `TaskStateConflictError`，三者互不替代。
+  - `retry_outcome(source_task_id, retry_task_id)` 只读对账复核结果，返回
+    `RetryOutcomeReport`（固定键序 `to_dict`）：`source_task_id`、
+    `retry_task_id`、双方终态 `source_status`/`retry_status`、
+    `retried_indexes`、按根任务输入顺序排列的 `items` 明细、按结论归类的
+    `recovered_item_ids`/`still_failed_item_ids`/`unresolved_item_ids`
+    （各自保持根任务输入顺序）及对应 `*_count`。对账范围严格沿用
+    `retry_failed` 的选取；每条明细（`RetryOutcomeItem`，固定键序
+    `to_dict`）含根任务零起 `index`、`item_id`、`before_*`/`after_*` 的
+    `status`/`stage`/`code`/`message` 与唯一 `outcome`。`before_status`
+    只取 `failed`（源任务失败项）或 `unresolved`（错误项及其后无结果项）；
+    `after_status` 只取 `passed`/`failed`/`unresolved`，分别记结论
+    `recovered`/`still_failed`/`still_unresolved`；定位沿用对应任务已有的
+    `stage`/`code`/`message`（无结果的项沿用该任务保留的基础设施错误定位），
+    未入选项不进入明细。对账不调用验证器、不创建任务、不改变状态或结果，
+    重复查询一致，不含证明材料、`public_inputs`、调用栈或未公开验证器信息。
+    任务不存在抛 `TaskNotFoundError`，任务未终结抛
+    `TaskStateConflictError`，复核任务不是源任务的直接 `retry_failed`
+    任务抛 `TaskLineageMismatchError`，三者互不替代。
 
 ## 约定
 
