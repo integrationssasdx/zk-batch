@@ -380,3 +380,103 @@ class TaskProgress:
             "completed": self.completed,
             "result": None if self.result is None else self.result.to_dict(),
         }
+
+
+# ============================================================ 复核对账
+
+# 复核对账的复核前状态（before_status 只取这两个）
+RETRY_BEFORE_FAILED = "failed"        # 源任务已有 status=failed 的结果
+RETRY_BEFORE_UNRESOLVED = "unresolved"  # 源任务基础设施错误项及其后无结果项
+
+# 复核对账的复核后状态（after_status 只取这三个）
+RETRY_AFTER_PASSED = "passed"            # 复核通过 -> recovered
+RETRY_AFTER_FAILED = "failed"            # 复核仍失败 -> still_failed
+RETRY_AFTER_UNRESOLVED = "unresolved"    # 复核仍未得出结论 -> still_unresolved
+
+# 复核对账的唯一 outcome
+RETRY_OUTCOME_RECOVERED = "recovered"
+RETRY_OUTCOME_STILL_FAILED = "still_failed"
+RETRY_OUTCOME_STILL_UNRESOLVED = "still_unresolved"
+
+
+@dataclass(frozen=True)
+class RetryOutcomeItem:
+    """单个复核项的对账明细。
+
+    ``index`` 为该项在根任务输入中的零起下标；复核前/后的 ``status``、
+    ``stage``、``code``、``message`` 分别以 ``before_``/``after_`` 前缀
+    给出，定位信息沿用对应任务已有结果的口径。``outcome`` 是该项唯一的
+    复核结论（``recovered``/``still_failed``/``still_unresolved``）。
+
+    复核前状态只可能是 ``failed`` 或 ``unresolved``；复核后状态只可能是
+    ``passed``、``failed`` 或 ``unresolved``。不承载证明材料、调用栈或
+    未公开验证器信息。
+    """
+
+    index: int
+    item_id: str
+    before_status: str
+    before_stage: str
+    before_code: str
+    before_message: str
+    after_status: str
+    after_stage: str
+    after_code: str
+    after_message: str
+    outcome: str
+
+    def to_dict(self) -> dict:
+        return {
+            "index": self.index,
+            "item_id": self.item_id,
+            "before_status": self.before_status,
+            "before_stage": self.before_stage,
+            "before_code": self.before_code,
+            "before_message": self.before_message,
+            "after_status": self.after_status,
+            "after_stage": self.after_stage,
+            "after_code": self.after_code,
+            "after_message": self.after_message,
+            "outcome": self.outcome,
+        }
+
+
+@dataclass(frozen=True)
+class RetryOutcomeReport:
+    """一次 ``retry_failed`` 复核的只读对账报告。
+
+    ``source_task_id``/``retry_task_id`` 为源任务与复核任务标识；
+    ``source_status``/``retry_status`` 为两者的终态；``retried_indexes``
+    为复核入选项在根任务输入中的零起下标（按根任务顺序）；``items`` 为
+    同序明细。三类 ``*_item_ids`` 按 outcome 归类，组内保持根任务顺序，
+    数量字段与各列表长度自洽。重复查询返回同值结果，不含证明材料。
+    """
+
+    source_task_id: str
+    retry_task_id: str
+    source_status: str
+    retry_status: str
+    retried_indexes: List[int]
+    items: List[RetryOutcomeItem]
+    recovered_item_ids: List[str]
+    still_failed_item_ids: List[str]
+    unresolved_item_ids: List[str]
+    recovered_count: int
+    still_failed_count: int
+    unresolved_count: int
+
+    def to_dict(self) -> dict:
+        return {
+            "source_task_id": self.source_task_id,
+            "retry_task_id": self.retry_task_id,
+            "source_status": self.source_status,
+            "retry_status": self.retry_status,
+            "retried_indexes": list(self.retried_indexes),
+            "items": [item.to_dict() for item in self.items],
+            "recovered_item_ids": list(self.recovered_item_ids),
+            "still_failed_item_ids": list(self.still_failed_item_ids),
+            "unresolved_item_ids": list(self.unresolved_item_ids),
+            "recovered_count": self.recovered_count,
+            "still_failed_count": self.still_failed_count,
+            "unresolved_count": self.unresolved_count,
+        }

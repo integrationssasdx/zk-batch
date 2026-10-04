@@ -121,6 +121,16 @@ class TaskStateConflictError(TaskError):
     """重复消费、终态后再次入队或任务状态互相冲突。"""
 
 
+class TaskLineageMismatchError(TaskError):
+    """复核任务与源任务没有直接 retry_failed 血缘关系。
+
+    由只读对账入口 :meth:`VerificationTaskQueue.retry_outcome` 抛出：
+    给定的复核任务并非由给定源任务经一次 :meth:`retry_failed` 直接创建。
+    与 :class:`TaskNotFoundError`（任一任务不存在）和
+    :class:`TaskStateConflictError`（任一任务未终结）互不替代。
+    """
+
+
 class NoRetryableItemsError(TaskError):
     """复核源任务没有任何可重试的验证项。
 
