@@ -27,6 +27,18 @@
   的结果，按源批次原序给出每个入选证明复核前后的定位与唯一结论
   （recovered / still_failed）。不调用验证器、不创建作业、不改变任何
   状态或结果，重复查询结果一致。
+* :meth:`reverify_groups` 以已完成作业失败定位中的聚合组为输入，按源批次
+  序取出选中组内的全部证明（保留 batch_id、材料、分组键与组内序）创建新
+  的 queued 作业，并记录独立的按组复核父子关系；重复复核得到不同
+  job_id，与 :meth:`reverify_failures` 的谱系互不覆盖。异常顺序：源作业
+  不存在 UnknownJobError、未 completed ResultUnavailableError、选择非法
+  或重复 InvalidGroupSelectionError、合法分组不属源失败定位
+  UnknownFailedGroupError；失败时不建作业、不改源作业。
+* :meth:`group_reverify_outcome` 只读对账按组复核结果：按请求输入的分组
+  顺序，逐组给出双方组级状态、每证前后状态与唯一结论（源组失败且复核整
+  组无失败 recovered，否则 still_failed）。不调用验证器、不创建作业、不
+  改变任何状态或结果，重复查询一致；谱系必须是直接的 ``reverify_groups``
+  父子关系，与逐证复核谱系互不替代。
 
 不持久化、不联网、不使用线程。
 """
@@ -35,16 +47,19 @@ from __future__ import annotations
 
 import itertools
 from collections import OrderedDict
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .engine import verify_batch_detailed
 from .errors import (
     CancelledJobError,
     CompletedJobError,
+    InvalidGroupSelectionError,
     NoFailedProofError,
     ResultUnavailableError,
+    GroupReverifyLineageMismatchError,
     ReverifyLineageMismatchError,
     RunningJobError,
+    UnknownFailedGroupError,
     UnknownJobError,
 )
 from .models import (
@@ -55,6 +70,10 @@ from .models import (
     REVERIFY_BEFORE_STATUS,
     BatchVerificationReport,
     BatchVerificationResult,
+    GroupReverifyGroupItem,
+    GroupReverifyOutcomeReport,
+    GroupReverifyProofItem,
+    GroupReverifySubmission,
     ReverifyOutcomeItem,
     ReverifyOutcomeReport,
     VerificationJob,
@@ -79,6 +98,9 @@ class VerificationQueue:
         self._reports: Dict[str, BatchVerificationReport] = {}
         # 复核父子关系：复核作业 id -> 源作业 id；重复复核各自记录、互不覆盖
         self._reverify_lineage: Dict[str, str] = {}
+        # 按组复核的父子关系：复核作业 id -> (源作业 id, 请求的分组顺序)；
+        # 与逐证复核谱系分开记录、互不替代。
+        self._group_reverify_lineage: Dict[str, Tuple[str, Tuple[str, ...]]] = {}
         self._counter = itertools.count(1)
 
     # ------------------------------------------------------------ 入队/执行
@@ -123,6 +145,7 @@ class VerificationQueue:
             self._jobs.pop(job.job_id, None)
             self._reports.pop(job.job_id, None)
             self._reverify_lineage.pop(job.job_id, None)
+            self._group_reverify_lineage.pop(job.job_id, None)
             raise
         job.status = STATUS_COMPLETED
         job.result = report.result
@@ -264,6 +287,135 @@ class VerificationQueue:
             )
         return _build_reverify_outcome(source, retry)
 
+    # ------------------------------------------------------------ 按组复核
+
+    def reverify_groups(
+        self,
+        job_id: str,
+        group_ids: Any,
+        verifiers: Any = None,
+    ) -> GroupReverifySubmission:
+        """按聚合组重验已完成作业，返回 :class:`GroupReverifySubmission`。
+
+        ``group_ids`` 必须是非空的列表或元组，元素为非空字符串且互不
+        重复；每个标识都必须出现在源作业结果的失败分组中。选证按源批次
+        序进行：先按源批次中分组首次出现的先后确定组序（请求顺序只影响
+        回执清单，不改变批次内证明的相对顺序），再把每个选中组的全部
+        证明按组内批次原序纳入子批次（``batch_id`` 不变、
+        ``public_inputs``/``proof`` 原样保留、分组键不变）；新作业是独立
+        的 queued 作业，执行时同样一次走完整的详细验证流水线。
+
+        ``verifiers`` 只作用于新作业，省略时使用队列默认验证器。创建时
+        记录按组复核的父子关系（新作业 -> 源作业），与
+        :meth:`reverify_failures` 的谱系分开；重复复核得到不同 job_id，
+        父子关系各自记录、互不覆盖。任何校验失败都不创建作业，源作业的
+        状态、批次与结果保持不变。
+
+        异常按以下顺序依次检查、互不替代：
+
+        * 源作业不存在 ——UnknownJobError；
+        * 存在但非 completed ——ResultUnavailableError；
+        * ``group_ids`` 不是非空列表/元组、元素不是非空字符串或有重复
+          ——InvalidGroupSelectionError；
+        * 选择合法但存在不属于源作业失败定位的分组
+          ——UnknownFailedGroupError。
+        """
+        job = self._require_job(job_id)
+        if job.status != STATUS_COMPLETED:
+            raise ResultUnavailableError(
+                f"job {job_id!r} has no result to reverify "
+                f"(status={job.status!r})"
+            )
+        _validate_group_selection(group_ids)
+
+        # 源作业失败定位中实际出现的分组标识（与 failure_groups 口径一致）。
+        failed_group_ids = {
+            failure.group_id for failure in job.result.failures
+        }
+        unknown = [gid for gid in group_ids if gid not in failed_group_ids]
+        if unknown:
+            raise UnknownFailedGroupError(
+                f"job {job_id!r} has no failed group {unknown[0]!r}"
+            )
+
+        # 按源批次序取组内全部证明：组序取源批次中的首次出现序，
+        # 组内保持源批次原序；证明对象原样保留（材料、分组键、组内序）。
+        selected_group_set = set(group_ids)
+        selected = [
+            raw
+            for raw in job.batch["proofs"]
+            if _raw_group_id(raw) in selected_group_set
+        ]
+        sub_batch = {
+            "batch_id": job.result.batch_id,
+            "proofs": selected,
+        }
+        new_job_id = self.enqueue(sub_batch, verifiers)
+        # 谱系同时保存请求的分组输入顺序，供 group_reverify_outcome
+        # 按输入序排列 groups（批次内证明顺序不等于请求顺序）。
+        self._group_reverify_lineage[new_job_id] = (
+            job_id,
+            tuple(group_ids),
+        )
+        return GroupReverifySubmission(
+            source_job_id=job_id,
+            job_id=new_job_id,
+            status=STATUS_QUEUED,
+            selected_group_ids=list(group_ids),
+            selected_proof_ids=[raw["proof_id"] for raw in selected],
+        )
+
+    def group_reverify_outcome(
+        self, source_job_id: str, retry_job_id: str
+    ) -> GroupReverifyOutcomeReport:
+        """只读对账 ``reverify_groups`` 的复核结果，返回
+        :class:`GroupReverifyOutcomeReport`。
+
+        对账范围严格沿用 ``reverify_groups`` 的选取（即复核作业实际验证
+        的分组与证明）；``groups`` 按请求输入的分组顺序排列，组内证明按
+        源批次原序。每组给出组级前后状态
+        （``aggregate_call_status``/``aggregate_verify_status``/
+        ``fell_back``）与每证前后 ``status``/``message``。源组失败且复核
+        后整组无失败证明记 ``recovered``，否则记 ``still_failed``。
+
+        本方法只读已保存的报告，不调用验证器、不创建作业、不改变任何
+        状态或结果，重复查询返回一致内容；报告只含定位信息，不含证明
+        材料、``public_inputs``、调用栈或未公开验证器信息。
+
+        * 任一作业不存在 ——UnknownJobError；
+        * 任一作业未 completed ——ResultUnavailableError；
+        * 均 completed 但 ``retry_job_id`` 不是 ``source_job_id`` 的直接
+          ``reverify_groups`` 作业
+          ——GroupReverifyLineageMismatchError。
+
+        三类异常互不替代，按上述顺序依次检查；按组谱系与逐证复核谱系
+        （:meth:`reverify_outcome`）互不替代。
+        """
+        source = self._require_job(source_job_id)
+        retry = self._require_job(retry_job_id)
+        for job in (source, retry):
+            if job.status != STATUS_COMPLETED:
+                raise ResultUnavailableError(
+                    f"job {job.job_id!r} has no result to reconcile "
+                    f"(status={job.status!r})"
+                )
+        lineage = self._group_reverify_lineage.get(retry_job_id)
+        if lineage is None or lineage[0] != source_job_id:
+            raise GroupReverifyLineageMismatchError(
+                f"job {retry_job_id!r} is not a direct reverify_groups "
+                f"job of {source_job_id!r}"
+            )
+        requested_group_ids = lineage[1]
+        return _build_group_reverify_outcome(
+            self._reports[source_job_id],
+            self._reports[retry_job_id],
+            requested_group_ids,
+            source_job_id,
+            retry_job_id,
+            source.status,
+            retry.status,
+        )
+
     # ---------------------------------------------------------------- 内部
 
     def _next_queued(self) -> Optional[VerificationJob]:
@@ -348,4 +500,119 @@ def _build_reverify_outcome(
         items=items,
         recovered_proof_ids=recovered_ids,
         still_failed_proof_ids=still_failed_ids,
+    )
+
+
+# ========================================================== 按组复核辅助
+
+def _raw_group_id(raw: Any) -> str:
+    """源批次中原始证明映射的分组标识（与引擎分组键同口径）。
+
+    能进入这里的源批次都已完整跑过详细流水线，三个分组字段必然存在且
+    为非空字符串。
+    """
+    return f"{raw['protocol']}:{raw['circuit_id']}:{raw['aggregation_key']}"
+
+
+def _validate_group_selection(group_ids: Any) -> None:
+    """校验分组选择：非空列表/元组、元素为非空字符串且不重复。"""
+    if not isinstance(group_ids, (list, tuple)) or len(group_ids) == 0:
+        raise InvalidGroupSelectionError(
+            "group_ids must be a non-empty list or tuple of non-empty str"
+        )
+    seen = set()
+    for gid in group_ids:
+        if not isinstance(gid, str) or not gid:
+            raise InvalidGroupSelectionError(
+                f"group id must be a non-empty str, got {gid!r}"
+            )
+        if gid in seen:
+            raise InvalidGroupSelectionError(f"duplicate group id: {gid!r}")
+        seen.add(gid)
+
+
+def _build_group_reverify_outcome(
+    source_report: BatchVerificationReport,
+    retry_report: BatchVerificationReport,
+    requested_group_ids: Tuple[str, ...],
+    source_job_id: str,
+    retry_job_id: str,
+    source_status: str,
+    retry_status: str,
+) -> GroupReverifyOutcomeReport:
+    """比对源作业与其直接按组复核作业的报告，生成组级对账报告（纯只读）。
+
+    明细范围即复核作业实际验证的分组（其批次就是按源批次序选出的整组
+    证明）；``groups`` 按请求输入的分组顺序排列，组内证明保持源批次原序。
+    组级与逐证前后定位分别取自双方已保存的详细报告；唯一结论以复核结果
+    的失败定位为准（整组无失败证明才记 recovered）。
+    """
+    source_groups = {g.group_id: g for g in source_report.groups}
+    retry_groups = {g.group_id: g for g in retry_report.groups}
+    # 复核结果中仍有失败定位的分组（权威失败口径，含单证全过但整组聚合
+    # 验证失败的组级归责情形）。
+    retry_failed_groups = {
+        failure.group_id for failure in retry_report.result.failures
+    }
+
+    items: List[GroupReverifyGroupItem] = []
+    recovered_ids: List[str] = []
+    still_failed_ids: List[str] = []
+    for group_id in requested_group_ids:
+        before_group = source_groups[group_id]
+        after_group = retry_groups[group_id]
+        before_details = {d.proof_id: d for d in before_group.proofs}
+        after_details = {d.proof_id: d for d in after_group.proofs}
+
+        # 组内证明以复核批次为准：即按源批次原序选出的整组证明。
+        proof_items = []
+        for proof_id in after_group.proof_ids:
+            before = before_details[proof_id]
+            after = after_details[proof_id]
+            proof_items.append(
+                GroupReverifyProofItem(
+                    proof_id=proof_id,
+                    before_status=before.status,
+                    before_message=before.message,
+                    after_status=after.status,
+                    after_message=after.message,
+                )
+            )
+
+        if group_id in retry_failed_groups:
+            outcome = OUTCOME_STILL_FAILED
+            still_failed_ids.append(group_id)
+        else:
+            outcome = OUTCOME_RECOVERED
+            recovered_ids.append(group_id)
+
+        items.append(
+            GroupReverifyGroupItem(
+                group_id=group_id,
+                proof_ids=list(after_group.proof_ids),
+                outcome=outcome,
+                before_aggregate_call_status=
+                    before_group.aggregate_call_status,
+                before_aggregate_verify_status=
+                    before_group.aggregate_verify_status,
+                before_fell_back=before_group.fell_back,
+                after_aggregate_call_status=
+                    after_group.aggregate_call_status,
+                after_aggregate_verify_status=
+                    after_group.aggregate_verify_status,
+                after_fell_back=after_group.fell_back,
+                proofs=proof_items,
+            )
+        )
+
+    return GroupReverifyOutcomeReport(
+        source_job_id=source_job_id,
+        retry_job_id=retry_job_id,
+        source_status=source_status,
+        retry_status=retry_status,
+        groups=items,
+        recovered_group_ids=recovered_ids,
+        still_failed_group_ids=still_failed_ids,
+        recovered_count=len(recovered_ids),
+        still_failed_count=len(still_failed_ids),
     )

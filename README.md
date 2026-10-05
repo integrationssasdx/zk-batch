@@ -55,6 +55,32 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     `UnknownJobError`，作业未 completed 抛 `ResultUnavailableError`，均
     completed 但 `retry_job_id` 不是 `source_job_id` 的直接复核作业抛
     `ReverifyLineageMismatchError`，三者互不替代。
+  - `reverify_groups(job_id, group_ids, verifiers=None)` 按聚合组复核：
+    `group_ids` 必须是非空列表/元组，元素为非空字符串且不重复，每个标识
+    都须属于源作业的失败定位。选证按源批次序（组序取源批次中分组首次出现
+    序、组内保持原序）取出选中组的**全部**证明，`batch_id`、材料与分组键
+    原样保留，交给独立的 queued 作业走完整详细流水线；返回
+    `GroupReverifySubmission`（`source_job_id`、`job_id`、
+    `status="queued"`、按输入序的 `selected_group_ids`、按源批次序的
+    `selected_proof_ids`，固定键序 `to_dict`）。异常顺序：源作业不存在
+    `UnknownJobError`、未 completed `ResultUnavailableError`、选择非法或
+    重复 `InvalidGroupSelectionError`、合法分组不属源失败定位
+    `UnknownFailedGroupError`；失败不建作业、不改源作业。重复复核生成不同
+    `job_id`，按组谱系与 `reverify_failures` 的谱系分开记录、互不覆盖。
+  - `group_reverify_outcome(source_job_id, retry_job_id)` 只读对账按组
+    复核结果，返回 `GroupReverifyOutcomeReport`（固定键序 `to_dict`）：
+    双方 `source_status`/`retry_status`、按请求输入序的 `groups`、
+    `recovered_group_ids`/`still_failed_group_ids` 与对应数量。每组
+    （`GroupReverifyGroupItem`）含 `group_id`、按组内批次原序的 `proof_ids`、
+    复核前后的 `aggregate_call_status`/`aggregate_verify_status`/
+    `fell_back` 与每证（`GroupReverifyProofItem`）前后 `status`/`message`；
+    源组失败且复核整组无失败证明记 `recovered`（含单证全过但整组归责的组
+    已恢复），否则 `still_failed`。对账只读已保存报告，不调用验证器、不创建
+    作业、不改变结果，重复查询一致，不含证明材料、`public_inputs`、调用栈
+    或未公开验证器信息。作业不存在抛 `UnknownJobError`，未 completed 抛
+    `ResultUnavailableError`，非直接 `reverify_groups` 谱系抛
+    `GroupReverifyLineageMismatchError`，三者及与
+    `ReverifyLineageMismatchError` 均互不替代。
 - `VerificationTaskQueue` —— 可排队、可定位失败原因的**逐项**批量验证队列，
   与上面的分组聚合队列相互独立；同样不起线程、不联网、不落盘。输入是一组
   按业务顺序排列的验证项，每项含稳定标识 `item_id`（非空字符串）与证明

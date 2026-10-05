@@ -84,6 +84,32 @@ class ReverifyLineageMismatchError(QueueError):
     """
 
 
+class InvalidGroupSelectionError(QueueError):
+    """``reverify_groups`` 的分组选择非法。
+
+    ``group_ids`` 必须是非空列表或元组，元素为非空字符串且不重复。
+    检出非法时不创建作业、不改变源作业。
+    """
+
+
+class UnknownFailedGroupError(QueueError):
+    """选中的合法分组标识不属于源作业的失败定位。
+
+    每个请求的分组标识都必须能在源作业结果的失败分组中找到；检出时不
+    创建作业、不改变源作业。
+    """
+
+
+class GroupReverifyLineageMismatchError(QueueError):
+    """复核作业不是源作业的直接 ``reverify_groups`` 作业。
+
+    按组对账时要求复核作业确由该源作业直接按组复核生成；与
+    :class:`UnknownJobError`（作业不存在）、
+    :class:`ResultUnavailableError`（作业未 completed）以及
+    :class:`ReverifyLineageMismatchError`（逐证复核谱系）互不替代。
+    """
+
+
 # ------------------------------------------------- 排队批量验证（任务流）
 
 class TaskValidationError(ZKBatchError):
