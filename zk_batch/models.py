@@ -234,7 +234,8 @@ TASK_QUEUED = "queued"
 TASK_PROCESSING = "processing"
 TASK_COMPLETED = "completed"
 TASK_FAILED = "failed"
-TASK_TERMINAL_STATUSES = (TASK_COMPLETED, TASK_FAILED)
+TASK_CANCELLED = "cancelled"
+TASK_TERMINAL_STATUSES = (TASK_COMPLETED, TASK_FAILED, TASK_CANCELLED)
 
 # 逐项验证的失败阶段（固定字面量，与单证验证流水线一一对应）
 ITEM_STAGE_PROOF_READ = "proof_read"
@@ -306,6 +307,32 @@ class TaskSubmission:
             "task_id": self.task_id,
             "status": self.status,
             "summary": self.summary.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class TaskCancellationReceipt:
+    """取消成功的回执。
+
+    ``status`` 固定 ``cancelled``；``completed`` 固定 0（取消的任务尚
+    未验证任何项）；``cancelled_item_ids`` 为整批验证项标识，按输入
+    顺序全量保留。只承载定位信息，不含证明材料、``public_inputs``、
+    调用栈或验证器信息。
+    """
+
+    task_id: str
+    status: str
+    total: int
+    completed: int
+    cancelled_item_ids: List[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "status": self.status,
+            "total": self.total,
+            "completed": self.completed,
+            "cancelled_item_ids": list(self.cancelled_item_ids),
         }
 
 

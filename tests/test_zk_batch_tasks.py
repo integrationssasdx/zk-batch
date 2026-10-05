@@ -24,6 +24,16 @@
   still_failed / still_unresolved）、归类 item_ids 与计数；固定键序
   to_dict；TaskNotFoundError / TaskStateConflictError /
   TaskLineageMismatchError 互不替代；查询幂等且不泄露证明材料。
+* 取消：cancel 仅 queued 可取消，返回 TaskCancellationReceipt（固定键序
+  to_dict，cancelled_item_ids 全量保序）；取消后不被 run_next/run_task
+  消费、不调用验证器；status/progress/result/task_error 的只读口径；
+  未知任务 TaskNotFoundError，processing/completed/failed/重复取消
+  TaskStateConflictError 且数据不变。
+* 取消后重排：retry_failed 将 cancelled 源任务全部未验证项按根顺序
+  建新 queued 任务（重复重试得不同 task_id，不动源任务，verifiers 仅
+  作用新任务、省略继承）；retry_outcome 对 cancelled 源任务或直接
+  复核任务只读对账，无结论项 before/after_status="unresolved"、
+  stage/code/message 为空、outcome="still_unresolved"。
 
 直接运行：python tests/test_zk_batch_tasks.py
 """
@@ -44,6 +54,7 @@ from zk_batch import (  # noqa: E402
     MAX_BATCH_ITEMS,
     NoRetryableItemsError,
     RetryOutcomeReport,
+    TaskCancellationReceipt,
     TaskLineageMismatchError,
     TaskNotFoundError,
     TaskProgress,
@@ -1094,6 +1105,284 @@ class TestRetryOutcome(unittest.TestCase):
         self.assertNotIn("blob", text)
         self.assertNotIn("public_inputs", text)
         self.assertNotIn("Verifier", text)
+
+
+# ================================================================ 取消
+
+class TestCancel(unittest.TestCase):
+    def test_cancel_queued_receipt(self):
+        q = VerificationTaskQueue(StubVerifier())
+        tid = q.submit([item("a"), item("b"), item("c")]).task_id
+        receipt = q.cancel(tid)
+        self.assertIsInstance(receipt, TaskCancellationReceipt)
+        self.assertEqual(receipt.task_id, tid)
+        self.assertEqual(receipt.status, "cancelled")
+        self.assertEqual(receipt.total, 3)
+        self.assertEqual(receipt.completed, 0)
+        self.assertEqual(receipt.cancelled_item_ids, ["a", "b", "c"])
+        # to_dict 固定键序
+        self.assertEqual(
+            list(receipt.to_dict()),
+            ["task_id", "status", "total", "completed",
+             "cancelled_item_ids"],
+        )
+        self.assertEqual(
+            receipt.to_dict(),
+            {
+                "task_id": tid,
+                "status": "cancelled",
+                "total": 3,
+                "completed": 0,
+                "cancelled_item_ids": ["a", "b", "c"],
+            },
+        )
+
+    def test_cancelled_task_not_consumed(self):
+        v = StubVerifier()
+        q = VerificationTaskQueue(v)
+        t1 = q.submit([item("a")]).task_id
+        t2 = q.submit([item("b")]).task_id
+        q.cancel(t1)
+        # run_next 跳过 cancelled，消费下一个 queued
+        self.assertEqual(q.run_next().task_id, t2)
+        # 显式消费 cancelled 任务 -> 状态冲突
+        with self.assertRaises(TaskStateConflictError):
+            q.run_task(t1)
+        # 验证器从未见到 cancelled 任务的证明
+        self.assertEqual(v.verified, ["b"])
+        self.assertIsNone(q.run_next())
+
+    def test_cancelled_task_queries_readonly(self):
+        v = StubVerifier()
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("a"), item("b")]).task_id
+        q.cancel(tid)
+        self.assertEqual(q.status(tid), "cancelled")
+        p = q.progress(tid)
+        self.assertEqual(p.status, "cancelled")
+        self.assertEqual((p.total, p.completed), (2, 0))
+        self.assertIsNone(p.result)
+        with self.assertRaises(TaskStateConflictError):
+            q.result(tid)
+        self.assertIsNone(q.task_error(tid))
+        # 查询不触发验证、不改变状态
+        self.assertEqual(v.verified, [])
+        self.assertEqual(q.status(tid), "cancelled")
+
+    def test_cancel_unknown_task(self):
+        q = VerificationTaskQueue(StubVerifier())
+        with self.assertRaises(TaskNotFoundError):
+            q.cancel("ghost")
+
+    def test_cancel_processing_conflict(self):
+        v = StubVerifier()
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("a")]).task_id
+
+        def cancel_during_verify(proof):
+            with self.assertRaises(TaskStateConflictError):
+                q.cancel(tid)
+            return True
+
+        v.verify = cancel_during_verify
+        q.run_next()
+        # 处理中取消被拒，任务正常完成、数据不变
+        self.assertEqual(q.status(tid), "completed")
+        self.assertEqual(q.result(tid).passed, 1)
+
+    def test_cancel_terminal_and_duplicate_conflict(self):
+        v = StubVerifier(error_ids={"bad"})
+        q = VerificationTaskQueue(v)
+        done = q.submit([item("ok")]).task_id
+        q.run_task(done)
+        failed = q.submit([item("bad")]).task_id
+        with self.assertRaises(VerificationInfrastructureError):
+            q.run_task(failed)
+        cancelled = q.submit([item("later")]).task_id
+        q.cancel(cancelled)
+
+        for tid in (done, failed, cancelled):
+            with self.assertRaises(TaskStateConflictError):
+                q.cancel(tid)
+        # 数据不变
+        self.assertEqual(q.status(done), "completed")
+        self.assertEqual(q.status(failed), "failed")
+        self.assertEqual(q.status(cancelled), "cancelled")
+        self.assertEqual(q.result(done).passed, 1)
+        self.assertIsNotNone(q.task_error(failed))
+
+    def test_cancel_receipt_no_sensitive_data(self):
+        q = VerificationTaskQueue(StubVerifier())
+        tid = q.submit([item("a")]).task_id
+        text = repr(q.cancel(tid).to_dict())
+        self.assertNotIn("blob", text)
+        self.assertNotIn("public_inputs", text)
+        self.assertNotIn("Verifier", text)
+
+
+# ================================================================ 取消后重排
+
+class TestRetryCancelled(unittest.TestCase):
+    def test_retry_cancelled_requeues_all_items(self):
+        v = StubVerifier()
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("a"), item("b"), item("c")]).task_id
+        q.cancel(tid)
+        receipt = q.retry_failed(tid)
+        self.assertIsInstance(receipt, TaskRetrySubmission)
+        self.assertEqual(receipt.source_task_id, tid)
+        self.assertNotEqual(receipt.task_id, tid)
+        self.assertEqual(receipt.status, "queued")
+        self.assertEqual(receipt.summary.total, 3)
+        self.assertEqual(receipt.summary.item_ids, ["a", "b", "c"])
+        self.assertEqual(receipt.retried_indexes, [0, 1, 2])
+        # 源任务不动
+        self.assertEqual(q.status(tid), "cancelled")
+        self.assertIsNone(q.task_error(tid))
+        # 新任务正常消费，index 保留根任务下标
+        result = q.run_task(receipt.task_id)
+        self.assertEqual(result.passed, 3)
+        self.assertEqual([r.index for r in result.results], [0, 1, 2])
+        self.assertEqual(v.verified, ["a", "b", "c"])
+
+    def test_retry_cancelled_repeated_gives_new_ids(self):
+        q = VerificationTaskQueue(StubVerifier())
+        tid = q.submit([item("a")]).task_id
+        q.cancel(tid)
+        r1 = q.retry_failed(tid)
+        r2 = q.retry_failed(tid)
+        self.assertNotEqual(r1.task_id, r2.task_id)
+        self.assertEqual(q.status(tid), "cancelled")
+        self.assertEqual(q.status(r1.task_id), "queued")
+        self.assertEqual(q.status(r2.task_id), "queued")
+
+    def test_retry_cancelled_verifiers_scoping(self):
+        default_v = StubVerifier(reject_ids={"a"})
+        q = VerificationTaskQueue(default_v)
+        tid = q.submit([item("a")]).task_id
+        q.cancel(tid)
+        # 省略 verifiers：继承源任务的选择
+        inherited = q.retry_failed(tid)
+        q.run_task(inherited.task_id)
+        self.assertEqual(q.result(inherited.task_id).failed, 1)
+        # 显式 verifiers 只作用新任务
+        pass_v = StubVerifier()
+        overridden = q.retry_failed(tid, verifiers=pass_v)
+        q.run_task(overridden.task_id)
+        self.assertEqual(q.result(overridden.task_id).passed, 1)
+        self.assertEqual(pass_v.verified, ["a"])
+
+    def test_retry_cancelled_via_retry_task(self):
+        # cancelled 的复核任务也可再次重排
+        q = VerificationTaskQueue(StubVerifier())
+        tid = q.submit([item("a"), item("b")]).task_id
+        q.cancel(tid)
+        r1 = q.retry_failed(tid)
+        q.cancel(r1.task_id)
+        r2 = q.retry_failed(r1.task_id)
+        self.assertEqual(r2.source_task_id, r1.task_id)
+        self.assertEqual(r2.retried_indexes, [0, 1])
+        self.assertEqual(q.run_task(r2.task_id).passed, 2)
+
+    def test_retry_outcome_cancelled_source(self):
+        v = StubVerifier()
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("a"), item("b")]).task_id
+        q.cancel(tid)
+        receipt = q.retry_failed(tid)
+        q.run_task(receipt.task_id)
+        report = q.retry_outcome(tid, receipt.task_id)
+        self.assertEqual(report.source_status, "cancelled")
+        self.assertEqual(report.retry_status, "completed")
+        self.assertEqual(report.retried_indexes, [0, 1])
+        for entry in report.items:
+            # 源任务无结论项：before 侧 unresolved 且定位为空
+            self.assertEqual(entry.before_status, "unresolved")
+            self.assertEqual(entry.before_stage, "")
+            self.assertEqual(entry.before_code, "")
+            self.assertEqual(entry.before_message, "")
+            self.assertEqual(entry.after_status, "passed")
+            self.assertEqual(entry.outcome, "recovered")
+        self.assertEqual(report.recovered_item_ids, ["a", "b"])
+        self.assertEqual(report.unresolved_item_ids, [])
+        self.assertEqual(report.recovered_count, 2)
+
+    def test_retry_outcome_cancelled_retry_task(self):
+        v = StubVerifier(reject_ids={"a"})
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("a")]).task_id
+        q.run_next()
+        receipt = q.retry_failed(tid)
+        q.cancel(receipt.task_id)
+        report = q.retry_outcome(tid, receipt.task_id)
+        self.assertEqual(report.retry_status, "cancelled")
+        entry = report.items[0]
+        self.assertEqual(entry.before_status, "failed")
+        self.assertEqual(entry.before_code, "rejected")
+        # 复核任务无结论项：after 侧 unresolved 且定位为空
+        self.assertEqual(entry.after_status, "unresolved")
+        self.assertEqual(entry.after_stage, "")
+        self.assertEqual(entry.after_code, "")
+        self.assertEqual(entry.after_message, "")
+        self.assertEqual(entry.outcome, "still_unresolved")
+        self.assertEqual(report.unresolved_item_ids, ["a"])
+        self.assertEqual(report.unresolved_count, 1)
+        self.assertEqual(report.recovered_item_ids, [])
+        self.assertEqual(report.still_failed_item_ids, [])
+
+    def test_retry_outcome_both_cancelled(self):
+        q = VerificationTaskQueue(StubVerifier())
+        tid = q.submit([item("a"), item("b")]).task_id
+        q.cancel(tid)
+        receipt = q.retry_failed(tid)
+        q.cancel(receipt.task_id)
+        report = q.retry_outcome(tid, receipt.task_id)
+        self.assertEqual(report.source_status, "cancelled")
+        self.assertEqual(report.retry_status, "cancelled")
+        for entry in report.items:
+            self.assertEqual(entry.before_status, "unresolved")
+            self.assertEqual(entry.after_status, "unresolved")
+            self.assertEqual(entry.outcome, "still_unresolved")
+        self.assertEqual(report.unresolved_item_ids, ["a", "b"])
+        self.assertEqual(report.unresolved_count, 2)
+
+    def test_retry_outcome_cancelled_readonly_idempotent(self):
+        v = StubVerifier()
+        q = VerificationTaskQueue(v)
+        tid = q.submit([item("a")]).task_id
+        q.cancel(tid)
+        receipt = q.retry_failed(tid)
+        q.cancel(receipt.task_id)
+        r1 = q.retry_outcome(tid, receipt.task_id)
+        r2 = q.retry_outcome(tid, receipt.task_id)
+        self.assertEqual(r1.to_dict(), r2.to_dict())
+        # 不调用验证器、不改变状态、不创建任务
+        self.assertEqual(v.verified, [])
+        self.assertEqual(q.status(tid), "cancelled")
+        self.assertEqual(q.status(receipt.task_id), "cancelled")
+        self.assertIsNone(q.run_next())
+
+    def test_retry_outcome_cancelled_lineage_and_state_errors(self):
+        q = VerificationTaskQueue(StubVerifier())
+        tid = q.submit([item("a")]).task_id
+        q.cancel(tid)
+        receipt = q.retry_failed(tid)
+        other = q.submit([item("b")]).task_id
+        # 未知任务优先
+        with self.assertRaises(TaskNotFoundError):
+            q.retry_outcome("ghost", receipt.task_id)
+        with self.assertRaises(TaskNotFoundError):
+            q.retry_outcome(tid, "ghost")
+        # 未终结任务
+        with self.assertRaises(TaskStateConflictError):
+            q.retry_outcome(tid, other)
+        # 非直接复核
+        q.cancel(other)
+        q.cancel(receipt.task_id)
+        with self.assertRaises(TaskLineageMismatchError):
+            q.retry_outcome(tid, other)
+        with self.assertRaises(TaskLineageMismatchError):
+            q.retry_outcome(other, receipt.task_id)
 
 
 if __name__ == "__main__":
