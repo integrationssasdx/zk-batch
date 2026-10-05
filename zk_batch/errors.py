@@ -84,6 +84,41 @@ class ReverifyLineageMismatchError(QueueError):
     """
 
 
+class InvalidGroupSelectionError(QueueError):
+    """``reverify_groups`` 的分组选择不合法。
+
+    ``group_ids`` 必须是非空列表或元组，元素为非空字符串且不重复；
+    非法（类型/空值/空字符串）或存在重复时抛出。请求不创建作业、不
+    改变源作业。
+    """
+
+
+class UnknownFailedGroupError(QueueError):
+    """``reverify_groups`` 选中的合法分组不属于源作业的失败定位。
+
+    即该分组标识没有出现在源作业结果的失败清单中；请求不创建作业、
+    不改变源作业。与 :class:`InvalidGroupSelectionError`（选择本身
+    非法）互不替代。
+    """
+
+    def __init__(self, group_id: str):
+        super().__init__(
+            f"group {group_id!r} is not among the source job's failed groups"
+        )
+        self.group_id = group_id
+
+
+class GroupReverifyLineageMismatchError(QueueError):
+    """复核作业不是源作业的直接 ``reverify_groups`` 作业。
+
+    分组复核对账只认可由 :meth:`VerificationQueue.reverify_groups` 为
+    该源作业直接生成的复核作业；普通 ``reverify_failures`` 谱系、其他
+    源作业的分组复核谱系均不匹配。与 :class:`UnknownJobError`
+    （作业不存在）和 :class:`ResultUnavailableError`（作业未
+    completed）互不替代。
+    """
+
+
 # ------------------------------------------------- 排队批量验证（任务流）
 
 class TaskValidationError(ZKBatchError):

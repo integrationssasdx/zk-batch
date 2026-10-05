@@ -55,6 +55,37 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     `UnknownJobError`，作业未 completed 抛 `ResultUnavailableError`，均
     completed 但 `retry_job_id` 不是 `source_job_id` 的直接复核作业抛
     `ReverifyLineageMismatchError`，三者互不替代。
+  - `reverify_groups(job_id, group_ids, verifiers=None)` 按**聚合组**复核已
+    完成作业的失败分组，返回 `GroupReverifySubmission`（固定键序
+    `to_dict`）：`source_job_id`、`job_id`、`status="queued"`、
+    `selected_group_ids`（按输入顺序）、`selected_proof_ids`（按源批次序：
+    组按输入顺序、组内按源批次原序）。`group_ids` 必须是非空列表或元组，
+    元素为非空字符串且不重复；从源批次中选出每个入选分组的**全部**证明
+    （不只是失败的证明），`batch_id`、证明材料与分组键原样保留，新作业
+    同样走完整的详细验证流水线；源作业状态与结果不变，新作业可取消、可
+    覆盖验证器。分组复核谱系与 `reverify_failures` 分开记录，重复复核生成
+    不同 `job_id` 且谱系互不覆盖。异常严格按序：源作业不存在
+    `UnknownJobError` → 非 completed `ResultUnavailableError` → 选择非法或
+    重复 `InvalidGroupSelectionError` → 合法分组不属源失败定位
+    `UnknownFailedGroupError`；任一失败都不建作业、不改源作业。
+  - `group_reverify_outcome(source_job_id, retry_job_id)` 只读对账分组复核
+    结果，返回 `GroupReverifyOutcomeReport`（固定键序 `to_dict`）：
+    `source_job_id`、`retry_job_id`、双方 `source_status`/`retry_status`、
+    `groups`、`recovered_group_ids`/`still_failed_group_ids`（各自保持输入
+    顺序）与 `recovered_count`/`still_failed_count`。`groups` 按提交时的
+    分组输入顺序排列，每组（`GroupReverifyOutcomeGroup`，固定键序
+    `to_dict`）含 `group_id`、`outcome`、`proof_ids`（组内源批次原序）、
+    `before_*`/`after_*` 的 `aggregate_call_status`/
+    `aggregate_verify_status`/`fell_back`，以及 `proofs` 中每证
+    （`GroupReverifyProofItem`，固定键序 `to_dict`）的
+    `proof_id`、前后 `status`/`message`。源组失败且复核后该组无失败证明
+    记 `recovered`，否则记 `still_failed`。对账只读已保存报告，不调用验证
+    器、不创建作业、不改变任何状态或结果，重复查询一致，不含证明材料、
+    `public_inputs`、调用栈或未公开验证器信息。任一作业不存在抛
+    `UnknownJobError`，任一作业未 completed 抛 `ResultUnavailableError`，
+    `retry_job_id` 不是 `source_job_id` 的直接 `reverify_groups` 作业抛
+    `GroupReverifyLineageMismatchError`（普通 `reverify_failures` 谱系
+    不匹配），三者互不替代。
 - `VerificationTaskQueue` —— 可排队、可定位失败原因的**逐项**批量验证队列，
   与上面的分组聚合队列相互独立；同样不起线程、不联网、不落盘。输入是一组
   按业务顺序排列的验证项，每项含稳定标识 `item_id`（非空字符串）与证明

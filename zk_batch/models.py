@@ -618,3 +618,138 @@ class ReverifyOutcomeReport:
             "recovered_proof_ids": list(self.recovered_proof_ids),
             "still_failed_proof_ids": list(self.still_failed_proof_ids),
         }
+
+
+# ====================================== 队列分组复核对账（reverify_groups）
+
+@dataclass(frozen=True)
+class GroupReverifySubmission:
+    """分组复核提交成功的回执。
+
+    ``source_job_id`` 为源作业标识；``job_id`` 为新建 queued 作业标识
+    （重复复核得到不同标识）；``status`` 固定 ``queued``。
+    ``selected_group_ids`` 按调用方输入顺序保留；
+    ``selected_proof_ids`` 按源批次原序给出入选分组的全部证明（组按
+    输入顺序、组内按源批次原序）。只承载定位信息，不含证明材料、
+    ``public_inputs``、调用栈或验证器信息。
+    """
+
+    source_job_id: str
+    job_id: str
+    status: str
+    selected_group_ids: List[str]
+    selected_proof_ids: List[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "source_job_id": self.source_job_id,
+            "job_id": self.job_id,
+            "status": self.status,
+            "selected_group_ids": list(self.selected_group_ids),
+            "selected_proof_ids": list(self.selected_proof_ids),
+        }
+
+
+@dataclass(frozen=True)
+class GroupReverifyProofItem:
+    """分组复核中单个证明的前后状态。
+
+    ``before_*`` 取自源作业保存的详细报告（组级
+    ``aggregate_call_status``/``aggregate_verify_status`` 与逐证
+    ``status``/``message``）；``after_*`` 取自复核作业同口径报告。
+    注意逐证状态可能为 ``passed``/``rejected``/``error``/``not_run``，
+    与普通 :class:`ReverifyOutcomeItem` 的 ``failed`` 口径不同。只承载
+    定位信息，不含证明材料、``public_inputs``、调用栈或验证器信息。
+    """
+
+    proof_id: str
+    before_status: str
+    before_message: str
+    after_status: str
+    after_message: str
+
+    def to_dict(self) -> dict:
+        return {
+            "proof_id": self.proof_id,
+            "before_status": self.before_status,
+            "before_message": self.before_message,
+            "after_status": self.after_status,
+            "after_message": self.after_message,
+        }
+
+
+@dataclass(frozen=True)
+class GroupReverifyOutcomeGroup:
+    """单个入选分组的复核前后明细。
+
+    ``group_id`` 为分组标识；``proof_ids`` 按组内源批次原序。
+    ``before_*``/``after_*`` 的组级状态与 ``fell_back`` 分别取自源作业
+    与复核作业保存的详细报告；``proofs`` 给出组内每证的前后状态。
+    ``outcome`` 只取 ``recovered``（源组失败且复核整组无失败）/
+    ``still_failed``（其他情况）。只承载定位信息，不含证明材料、
+    ``public_inputs``、调用栈或验证器信息。
+    """
+
+    group_id: str
+    outcome: str
+    proof_ids: List[str]
+    before_aggregate_call_status: str
+    before_aggregate_verify_status: str
+    before_fell_back: bool
+    after_aggregate_call_status: str
+    after_aggregate_verify_status: str
+    after_fell_back: bool
+    proofs: List[GroupReverifyProofItem]
+
+    def to_dict(self) -> dict:
+        return {
+            "group_id": self.group_id,
+            "outcome": self.outcome,
+            "proof_ids": list(self.proof_ids),
+            "before_aggregate_call_status": self.before_aggregate_call_status,
+            "before_aggregate_verify_status": (
+                self.before_aggregate_verify_status
+            ),
+            "before_fell_back": self.before_fell_back,
+            "after_aggregate_call_status": self.after_aggregate_call_status,
+            "after_aggregate_verify_status": (
+                self.after_aggregate_verify_status
+            ),
+            "after_fell_back": self.after_fell_back,
+            "proofs": [proof_item.to_dict() for proof_item in self.proofs],
+        }
+
+
+@dataclass(frozen=True)
+class GroupReverifyOutcomeReport:
+    """``reverify_groups`` 复核结果的只读对账报告。
+
+    ``source_job_id``/``retry_job_id`` 与双方 ``status``；``groups`` 按
+    调用方提交时的分组输入顺序排列；``recovered_group_ids``/
+    ``still_failed_group_ids`` 按结论归类、各自保持输入顺序；两个
+    ``*_count`` 为对应归类的数量。只承载定位信息，不含证明材料、
+    ``public_inputs``、调用栈或未公开验证器信息。
+    """
+
+    source_job_id: str
+    retry_job_id: str
+    source_status: str
+    retry_status: str
+    groups: List[GroupReverifyOutcomeGroup]
+    recovered_group_ids: List[str]
+    still_failed_group_ids: List[str]
+    recovered_count: int
+    still_failed_count: int
+
+    def to_dict(self) -> dict:
+        return {
+            "source_job_id": self.source_job_id,
+            "retry_job_id": self.retry_job_id,
+            "source_status": self.source_status,
+            "retry_status": self.retry_status,
+            "groups": [group.to_dict() for group in self.groups],
+            "recovered_group_ids": list(self.recovered_group_ids),
+            "still_failed_group_ids": list(self.still_failed_group_ids),
+            "recovered_count": self.recovered_count,
+            "still_failed_count": self.still_failed_count,
+        }
