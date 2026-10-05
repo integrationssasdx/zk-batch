@@ -409,6 +409,55 @@ class TaskProgress:
         }
 
 
+# ============================================================ 调度优先级
+
+# 任务调度优先级的闭区间边界；普通任务缺省为 MIN_TASK_PRIORITY
+MIN_TASK_PRIORITY = 0
+MAX_TASK_PRIORITY = 100
+
+
+@dataclass(frozen=True)
+class TaskScheduleEntry:
+    """调度队列中单个 queued 任务的只读快照。
+
+    ``queue_position`` 为按执行顺序的位次（1 起）；``total`` 为该任务
+    整批验证项数。只承载调度定位信息，不含证明材料、``public_inputs``、
+    调用栈或验证器信息。
+    """
+
+    task_id: str
+    priority: int
+    queue_position: int
+    total: int
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "priority": self.priority,
+            "queue_position": self.queue_position,
+            "total": self.total,
+        }
+
+
+@dataclass(frozen=True)
+class TaskScheduleReport:
+    """当前 queued 任务的只读调度报告。
+
+    ``entries`` 只含 queued 任务，按执行顺序排列（优先级高者在前，
+    同值按入队先后）；``queued_count`` 等于条目数；空队列时
+    ``queued_count`` 为 0 且 ``entries`` 为空。
+    """
+
+    queued_count: int
+    entries: List[TaskScheduleEntry]
+
+    def to_dict(self) -> dict:
+        return {
+            "queued_count": self.queued_count,
+            "entries": [entry.to_dict() for entry in self.entries],
+        }
+
+
 # ============================================================ 复核对账
 
 # 对账前后可能出现的结果之外的状态：入选项在该次验证中尚无结果

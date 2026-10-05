@@ -60,15 +60,28 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
   按业务顺序排列的验证项，每项含稳定标识 `item_id`（非空字符串）与证明
   材料 `proof`（非空映射，字段口径同 `verify_batch` 的单证：`proof_id`、
   `protocol`、`circuit_id`、`aggregation_key`、`public_inputs`、`proof`）。
-  - `submit(items, verifiers=None)` 先完成**完整输入校验**，全部通过后才
+  - `submit(items, verifiers=None, priority=None)` 先完成**完整输入校验**，全部通过后才
     生成稳定任务标识并入队，返回 `TaskSubmission`（`task_id`、
     `status="queued"`、`summary`：`total` 与按输入顺序的 `item_ids`）。
     校验错误在入队前抛出，请求不进入队列、不生成任务标识，优先级固定为：
     空批次 `EmptyBatchError` → 超过公开上限 `MAX_BATCH_ITEMS` 的
     `BatchSizeLimitError` → 按输入顺序逐项检查的 `InvalidItemIdError`
     （标识缺失/非非空字符串）与 `InvalidProofFormatError`
-    （缺 `proof` 或不是非空映射）→ 同批重复标识 `DuplicateItemIdError`，
-    不混用其他异常。
+    （缺 `proof` 或不是非空映射）→ 同批重复标识 `DuplicateItemIdError`
+    → 优先级非法 `InvalidPriorityError`，不混用其他异常。
+  - 调度优先级：`submit`/`retry_failed` 的 `priority` 只接受 0 到 100
+    闭区间整数（`bool` 不算整数），普通任务缺省为 0，复核任务缺省继承
+    源任务值，显式值只作用于新任务；非法值抛 `InvalidPriorityError`，
+    不建任务也不改源任务。`run_next()` 只消费最高 `priority` 的 queued
+    任务，同值按入队先后，终态任务不参与排序；`run_task(task_id)` 仍
+    消费指定任务，不改其他位置。`schedule()` 只读返回
+    `TaskScheduleReport`（固定键序 `to_dict`：`queued_count` 与
+    `entries`；每条 `TaskScheduleEntry` 固定键序输出 `task_id`、
+    `priority`、`queue_position`（1 起）、`total`），`entries` 只含
+    queued 任务并按执行顺序排列，空队列返回 `queued_count=0` 与空
+    `entries`；重复查询不调用验证器、不消费、不改变状态或结果。
+    `priority` 不进入 proof、`public_inputs`、调用栈或验证器信息，
+    既有 `to_dict` 键序与 `retry_outcome` 不变。
   - `run_next()` / `run_task(task_id)` 按输入顺序逐项验证。单个证明失败不
     中止同批其他项，每项只验证一次。`progress(task_id)` 返回
     `TaskProgress`：`status` 与真实 `completed`/`total` 进度，任务未结束时
@@ -101,7 +114,7 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     仍为整批总数）；错误对象固定携带 `index`/`item_id`/`stage`/`code`。
   - 终态与结果查询保持幂等：不再次调用验证器、不改变状态，重复查询返回同一
     结果对象；定位信息绝不包含完整证明材料、内部调用栈或未公开验证器信息。
-  - `retry_failed(task_id, verifiers=None)` 从 completed/failed/cancelled
+  - `retry_failed(task_id, verifiers=None, priority=None)` 从 completed/failed/cancelled
     源任务选取
     待复核项，按根任务输入顺序创建独立的 queued 任务，返回
     `TaskRetrySubmission`（`source_task_id`、`task_id`、`status="queued"`、

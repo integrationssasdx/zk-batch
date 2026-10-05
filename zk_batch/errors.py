@@ -118,6 +118,16 @@ class InvalidProofFormatError(TaskValidationError):
     """证明材料不满足公开格式约束（缺 ``proof`` 字段或其不是非空映射）。"""
 
 
+class InvalidPriorityError(TaskValidationError):
+    """``priority`` 不是 [0, 100] 闭区间内的整数（``bool`` 不算整数）。
+
+    提交/复核校验中最后检查；非法值不生成任务、不改变源任务。与
+    :class:`TaskNotFoundError`（任务不存在）、
+    :class:`TaskStateConflictError`（任务状态冲突）和
+    :class:`NoRetryableItemsError`（无可复核项）互不替代。
+    """
+
+
 class TaskError(ZKBatchError):
     """任务队列相关异常的根。"""
 
