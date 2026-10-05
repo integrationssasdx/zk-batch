@@ -73,14 +73,26 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     中止同批其他项，每项只验证一次。`progress(task_id)` 返回
     `TaskProgress`：`status` 与真实 `completed`/`total` 进度，任务未结束时
     `result` 为 `None`，不提前给出最终结果。
+  - `cancel(task_id)` 仅取消 queued 任务，返回 `TaskCancellationReceipt`
+    （固定键序 `to_dict`：`task_id`、`status="cancelled"`、`total`、
+    `completed=0`、按任务输入顺序全量保序的 `cancelled_item_ids`）。取消后
+    任务进入 `cancelled` 终态，不被 `run_next`/`run_task` 消费、不调用
+    验证器；回执不含证明材料、`public_inputs`、调用栈或验证器信息。未知任务
+    抛 `TaskNotFoundError`；processing/completed/failed 或重复取消抛
+    `TaskStateConflictError`，任务数据不变。cancelled 任务的 `progress`
+    返回 `total`、`completed=0`、`result=None`；`result` 抛
+    `TaskStateConflictError`，`task_error` 返回 `None`；所有查询只读、不
+    触发验证。
   - 终态结果 `result(task_id)` 返回 `BatchTaskResult`：`total`/`passed`/
     `failed`、与输入顺序一致的 `results`（每项含 `index` 输入序号、
     `item_id`、`status`（`passed`/`failed`）、`stage`、稳定 `code` 与供
     人工定位的 `message`），以及按输入顺序的 `failed_item_ids`。单证被拒
     的失败项为 `stage="verify"`、`code="rejected"`。
-  - 状态机为 `queued → processing → completed | failed`。查询不存在的任务
-    抛 `TaskNotFoundError`；任务尚未结束时取结果、重复消费任务（含处理中
-    再次 `run_next`/`run_task`）、终态后再次入队/消费等状态冲突抛
+  - 状态机为 `queued → processing → completed | failed`，且 queued 可经
+    `cancel` 进入 `cancelled`。查询不存在的任务抛 `TaskNotFoundError`；
+    任务尚未结束时取结果、重复消费任务（含处理中再次
+    `run_next`/`run_task`）、终态后再次入队/消费，或取消
+    processing/completed/failed/cancelled 任务等状态冲突抛
     `TaskStateConflictError`。
   - 系统无法读取证明材料（`stage="proof_read"`、`code="invalid_proof"`）、
     验证器执行失败（`stage="verify"`、`code="verifier_fault"`；协议无验证器
@@ -91,36 +103,43 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     仍为整批总数）；错误对象固定携带 `index`/`item_id`/`stage`/`code`。
   - 终态与结果查询保持幂等：不再次调用验证器、不改变状态，重复查询返回同一
     结果对象；定位信息绝不包含完整证明材料、内部调用栈或未公开验证器信息。
-  - `retry_failed(task_id, verifiers=None)` 从 completed/failed 源任务选取
-    待复核项，按根任务输入顺序创建独立的 queued 任务，返回
+  - `retry_failed(task_id, verifiers=None)` 从 completed/failed/cancelled
+    源任务选取待复核项，按根任务输入顺序创建独立的 queued 任务，返回
     `TaskRetrySubmission`（`source_task_id`、`task_id`、`status="queued"`、
     `summary`、`retried_indexes` 根任务输入零起下标）。completed 只选
     `status="failed"` 的项；failed 从保留的
     `VerificationInfrastructureError.index` 对应项起，纳入该错误项及其后
     尚无结果的项，再与已有失败项按根任务输入顺序去重（`result_save` 失败
-    且结果已覆盖全部输入时只选失败项）。新任务沿用
+    且结果已覆盖全部输入时只选失败项）；cancelled 源任务全部入队项均未
+    验证，按根任务输入顺序全部入选。新任务沿用
     `run_next`/`run_task`/`status`/`progress`/`result`/`task_error`，每项只
     验证一次，`ItemResult.index` 与再次失败的定位都保留根任务下标；重复
-    复核生成不同任务标识，源任务状态、结果与错误定位不变。`verifiers` 只
-    作用于新任务，省略时继承源任务的验证器选择。无可复核项抛
-    `NoRetryableItemsError`，未知任务抛 `TaskNotFoundError`，queued 或
-    processing 源任务抛 `TaskStateConflictError`，三者互不替代。
+    复核生成不同任务标识，源任务状态、结果与错误定位不变（cancelled 源
+    任务保持 cancelled）。`verifiers` 只作用于新任务，省略时继承源任务的
+    验证器选择。无可复核项抛 `NoRetryableItemsError`，未知任务抛
+    `TaskNotFoundError`，queued 或 processing 源任务抛
+    `TaskStateConflictError`，三者互不替代。
   - `retry_outcome(source_task_id, retry_task_id)` 只读对账复核结果，返回
     `RetryOutcomeReport`（固定键序 `to_dict`）：`source_task_id`、
     `retry_task_id`、双方终态 `source_status`/`retry_status`、
     `retried_indexes`、按根任务输入顺序排列的 `items` 明细、按结论归类的
     `recovered_item_ids`/`still_failed_item_ids`/`unresolved_item_ids`
     （各自保持根任务输入顺序）及对应 `*_count`。对账范围严格沿用
-    `retry_failed` 的选取；每条明细（`RetryOutcomeItem`，固定键序
-    `to_dict`）含根任务零起 `index`、`item_id`、`before_*`/`after_*` 的
-    `status`/`stage`/`code`/`message` 与唯一 `outcome`。`before_status`
-    只取 `failed`（源任务失败项）或 `unresolved`（错误项及其后无结果项）；
-    `after_status` 只取 `passed`/`failed`/`unresolved`，分别记结论
-    `recovered`/`still_failed`/`still_unresolved`；定位沿用对应任务已有的
-    `stage`/`code`/`message`（无结果的项沿用该任务保留的基础设施错误定位），
-    未入选项不进入明细。对账不调用验证器、不创建任务、不改变状态或结果，
-    重复查询一致，不含证明材料、`public_inputs`、调用栈或未公开验证器信息。
-    任务不存在抛 `TaskNotFoundError`，任务未终结抛
+    `retry_failed` 的选取（源任务为 cancelled 时含全部入队项）；每条明细
+    （`RetryOutcomeItem`，固定键序 `to_dict`）含根任务零起 `index`、
+    `item_id`、`before_*`/`after_*` 的 `status`/`stage`/`code`/`message`
+    与唯一 `outcome`。`before_status` 只取 `failed`（源任务失败项）或
+    `unresolved`（failed 源任务的错误项及其后无结果项、以及 cancelled 源
+    任务的全部入选项）；`after_status` 只取
+    `passed`/`failed`/`unresolved`，分别记结论
+    `recovered`/`still_failed`/`still_unresolved`；定位沿用对应任务已有
+    的 `stage`/`code`/`message`（failed 任务无结果的项沿用其保留的基础
+    设施错误定位；cancelled 任务未经验证、没有失败定位，其无结论项的
+    `stage`/`code`/`message` 为空串），未入选项不进入明细。源任务或直接
+    复核任务为 cancelled 时同样只读对账、不改变其 cancelled 结论。对账不
+    调用验证器、不创建任务、不改变状态或结果，重复查询一致，不含证明
+    材料、`public_inputs`、调用栈或未公开验证器信息。任务不存在抛
+    `TaskNotFoundError`，任务未终结（queued/processing）抛
     `TaskStateConflictError`，复核任务不是源任务的直接 `retry_failed`
     任务抛 `TaskLineageMismatchError`，三者互不替代。
 

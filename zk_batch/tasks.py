@@ -5,10 +5,11 @@
 提交前一次完成完整输入校验，通过后进入独立的内存队列并按输入顺序逐项
 验证，单证明失败不中止同批其他项。
 
-状态机（仅四个状态）：
+状态机（仅五个状态）：
 
     queued -> processing -> completed
-                          \\-> failed（基础设施错误；保留此前已完成项）
+         |                 \\-> failed（基础设施错误；保留此前已完成项）
+         \\-> cancelled（仅 queued 可取消；未经验证即终结）
 
 * :meth:`VerificationTaskQueue.submit` 完成提交前校验并入队，返回
   :class:`TaskSubmission`（稳定任务标识、``queued`` 状态与批次摘要）。
@@ -17,18 +18,28 @@
 * :meth:`run_next` 同步消费最早的 queued 任务；:meth:`run_task` 消费指定
   任务。任务仅会被消费一次：处理中重复消费、终态后再次入队/消费均抛
   :class:`TaskStateConflictError`。
+* :meth:`cancel` 仅取消 queued 任务并返回
+  :class:`TaskCancellationReceipt`：取消后任务进入 ``cancelled`` 终态，
+  不被 run_next/run_task 消费、不调用验证器。未知任务抛
+  :class:`TaskNotFoundError`；processing/completed/failed/重复取消均抛
+  :class:`TaskStateConflictError`，任务数据不变。
 * 处理过程中 :meth:`progress` 返回真实完成进度（``completed`` 为已结束
-  项数），未结束时 ``result`` 为 ``None``，不提前给出最终结果。
+  项数），未结束时 ``result`` 为 ``None``，不提前给出最终结果；cancelled
+  任务 ``completed=0``、``result=None``。
 * 系统无法读取证明材料、验证器执行失败或无法保存最终结果时抛
   :class:`VerificationInfrastructureError`，任务进入 ``failed`` 终态，
   此前已完成项的结果与定位信息完整保留；终态结果查询幂等。
-* :meth:`retry_failed` 从 completed/failed 源任务挑出待复核项，按根任务
-  输入顺序创建独立的 queued 任务（新任务标识，``ItemResult.index`` 保留
-  根任务下标）；源任务的状态、结果与错误定位不受影响。
+* :meth:`retry_failed` 从 completed/failed/cancelled 源任务挑出待复核
+  项，按根任务输入顺序创建独立的 queued 任务（新任务标识，
+  ``ItemResult.index`` 保留根任务下标）；源任务的状态、结果与错误定位
+  不受影响。cancelled 源任务的全部入队项均未验证，全部入选。
 * :meth:`retry_outcome` 只读对账复核结果：比对源任务与直接复核任务的
   终态结果，按根任务输入顺序给出每项复核前后的状态与唯一结论
-  （recovered / still_failed / still_unresolved）。不调用验证器、不
-  创建任务、不改变任何状态或结果，重复查询结果一致。
+  （recovered / still_failed / still_unresolved）。源任务或直接复核任务
+  为 cancelled 时仍只读对账：无结论项 before_status 或 after_status 为
+  ``unresolved``，对应 stage/code/message 为空，outcome 为
+  ``still_unresolved``。不调用验证器、不创建任务、不改变任何状态或结果，
+  重复查询结果一致。
 
 不持久化、不联网、不使用线程。失败定位只含输入序号、项标识、失败阶段、
 稳定错误码与供人工定位的描述，绝不包含完整证明材料、内部调用栈或未公开
@@ -77,6 +88,7 @@ from .models import (
     OUTCOME_RECOVERED,
     OUTCOME_STILL_FAILED,
     OUTCOME_STILL_UNRESOLVED,
+    TASK_CANCELLED,
     TASK_COMPLETED,
     TASK_FAILED,
     TASK_PROCESSING,
@@ -88,6 +100,7 @@ from .models import (
     Proof,
     RetryOutcomeItem,
     RetryOutcomeReport,
+    TaskCancellationReceipt,
     TaskProgress,
     TaskRetrySubmission,
     TaskSubmission,
@@ -199,13 +212,15 @@ class VerificationTaskQueue:
         * failed —— 从保留的 :class:`VerificationInfrastructureError`
           的 ``index`` 对应项起，纳入该错误项及其后尚无结果的项，再与
           已有失败项按根任务输入顺序去重；``index`` 为 ``None``（如
-          result_save 失败且结果已覆盖全部输入）时只选失败项。
+          result_save 失败且结果已覆盖全部输入）时只选失败项；
+        * cancelled —— 取消时未经验证，全部入队项均无结论，按根任务
+          输入顺序全部入选。
 
         新任务按根任务输入顺序逐项验证入选项，每项只验证一次；
         ``ItemResult.index`` 与再次失败时的错误定位都保留根任务下标，
         沿用 run_next/run_task/status/progress/result/task_error 查询。
         重复复核生成不同的新任务标识；源任务的状态、结果、错误定位与
-        保存历史不受影响。
+        保存历史不受影响（cancelled 源任务保持 cancelled）。
 
         ``verifiers`` 只作用于新任务（解析与契约异常口径与
         :meth:`submit` 相同），省略时继承源任务的验证器选择。
@@ -252,16 +267,19 @@ class VerificationTaskQueue:
 
         对账范围严格沿用 ``retry_failed`` 的选取（即复核任务实际验证的
         项，按根任务输入顺序）：源任务为 completed 时只含失败项；为
-        failed 时含错误项及其后尚无结果的项并入已有失败项。每项给出
-        复核前后定位与唯一结论：
+        failed 时含错误项及其后尚无结果的项并入已有失败项；为 cancelled
+        时含全部入队项。每项给出复核前后定位与唯一结论：
 
         * ``before_status`` 只取 ``failed``/``unresolved``——源任务中的
-          失败项取 ``failed``，错误项及其后无结果项取 ``unresolved``；
+          失败项取 ``failed``，错误项及其后无结果项、以及 cancelled 源
+          任务的全部入选项取 ``unresolved``；
         * ``after_status`` 只取 ``passed``/``failed``/``unresolved``，
           分别记结论 ``recovered``/``still_failed``/``still_unresolved``；
         * ``stage``/``code``/``message`` 沿用对应任务已有的定位（有结果
           的项取 :class:`ItemResult` 字段，无结果的项沿用该任务保留的
-          基础设施错误定位）；未入选项不进入明细。
+          基础设施错误定位）；但 cancelled 任务未经验证、没有失败定位，
+          其无结论项的 ``stage``/``code``/``message`` 一律为空串；未入选
+          项不进入明细。
 
         本方法不调用验证器、不创建任务、不改变任何任务的状态或结果，
         重复查询返回一致内容；报告只含定位信息，不含证明材料、
@@ -325,10 +343,47 @@ class VerificationTaskQueue:
             )
         return self._consume(task_id)
 
+    # --------------------------------------------------------------- 取消
+
+    def cancel(self, task_id: str) -> TaskCancellationReceipt:
+        """取消 queued 任务，返回 :class:`TaskCancellationReceipt`。
+
+        取消时任务未经验证即进入 ``cancelled`` 终态：不会再被
+        :meth:`run_next`/:meth:`run_task` 消费，也不调用任何验证器。回执
+        的 ``status`` 固定 ``cancelled``，``total`` 为入队项数，
+        ``completed`` 固定 ``0``，``cancelled_item_ids`` 为全部入队项
+        标识（按任务输入顺序）；与 :meth:`progress` 同口径，且不含证明
+        材料、``public_inputs``、调用栈或验证器信息。
+
+        * 任务不存在 ——:class:`TaskNotFoundError`；
+        * 任务为 processing/completed/failed，或已 cancelled 重复取消
+          ——:class:`TaskStateConflictError`，任务数据保持不变。
+
+        与 run_next/run_task 同口径：任务处理中（如验证器回调内）重入本
+        方法，即使目标是另一个 queued 任务，也抛
+        :class:`TaskStateConflictError`，串行队列处理期间不改变任何任务。
+        """
+        self._ensure_no_active_consumer()
+        record = self._require_task(task_id)
+        if record.status != TASK_QUEUED:
+            raise TaskStateConflictError(
+                f"task {task_id!r} cannot be cancelled in status "
+                f"{record.status!r}"
+            )
+        record.status = TASK_CANCELLED
+        item_ids = [item["item_id"] for item in record.items]
+        return TaskCancellationReceipt(
+            task_id=record.task_id,
+            status=TASK_CANCELLED,
+            total=record.total,
+            completed=0,
+            cancelled_item_ids=item_ids,
+        )
+
     # --------------------------------------------------------------- 查询
 
     def status(self, task_id: str) -> str:
-        """返回 queued/processing/completed/failed；不存在抛
+        """返回 queued/processing/completed/failed/cancelled；不存在抛
         :class:`TaskNotFoundError`。查询不触发验证、不改变状态。"""
         return self._require_task(task_id).status
 
@@ -337,7 +392,8 @@ class VerificationTaskQueue:
 
         ``completed`` 为已经得出结论（通过或失败）的项数，是真实进度；
         任务未结束时 ``result`` 为 ``None``，不提前给出最终结果。终态后
-        重复查询返回同一稳定结果对象。不存在抛
+        重复查询返回同一稳定结果对象。cancelled 任务未经任何验证，
+        ``completed=0`` 且 ``result=None``。不存在抛
         :class:`TaskNotFoundError`。
         """
         record = self._require_task(task_id)
@@ -353,8 +409,8 @@ class VerificationTaskQueue:
         """返回终态结果：completed 返回完整结果，failed 返回保留了此前已
         完成项的部分结果（``total`` 仍为整批总数）。
 
-        queued/processing 尚未结束、不能提前给出最终结果，抛
-        :class:`TaskStateConflictError`；不存在抛
+        queued/processing/cancelled 尚未得出最终结果（cancelled 未经验证）
+        不能提前取结果，抛 :class:`TaskStateConflictError`；不存在抛
         :class:`TaskNotFoundError`。重复查询幂等，不再次调用验证器。
         """
         record = self._require_task(task_id)
@@ -368,9 +424,10 @@ class VerificationTaskQueue:
     def task_error(
         self, task_id: str
     ) -> Optional[VerificationInfrastructureError]:
-        """返回 failed 任务保留的基础设施错误；其余状态返回 ``None``。
+        """返回 failed 任务保留的基础设施错误；其余状态（含 cancelled）
+        返回 ``None``。
 
-        不存在抛 :class:`TaskNotFoundError`。
+        不存在抛 :class:`TaskNotFoundError`。查询只读，不触发验证。
         """
         return self._require_task(task_id).error
 
@@ -538,10 +595,15 @@ def _select_retry_indexes(record: _TaskRecord) -> List[int]:
     completed：只选失败项。failed：错误项及其后尚无结果的项，再并入
     已有失败项；错误无明确项下标（如 result_save 失败）时，尚无结果
     的项从整批起算——结果已覆盖全部输入时自然只剩失败项。
+    cancelled：未经验证即终结，无任何已完成项或错误定位，全部入队项
+    均无结论，按根任务输入顺序全部入选。
     """
     failed = {r.index for r in record.results if r.status == ITEM_FAILED}
     if record.status == TASK_COMPLETED:
         return sorted(failed)
+    if record.status == TASK_CANCELLED:
+        # record.results 必为空（取消不验证）；全部入队项入选。
+        return sorted(record.indexes)
     done = {r.index for r in record.results}
     error = record.error
     start = (
@@ -569,6 +631,17 @@ def _error_location(error: Optional[VerificationInfrastructureError]):
     )
 
 
+def _unresolved_location(record: _TaskRecord):
+    """无结论项沿用的定位三元组。
+
+    failed 任务沿用其保留的基础设施错误定位；cancelled 任务未经验证、
+    没有任何失败定位，一律返回空串。
+    """
+    if record.status == TASK_CANCELLED:
+        return "", "", ""
+    return _error_location(record.error)
+
+
 def _build_retry_outcome(
     source: _TaskRecord, retry: _TaskRecord
 ) -> RetryOutcomeReport:
@@ -576,6 +649,7 @@ def _build_retry_outcome(
 
     明细范围即复核任务实际验证的项（``retry.indexes``，按根任务输入
     顺序）；前后定位分别取自源任务与复核任务已保存的结果/错误。
+    cancelled 一方未经验证，其无结论项为 ``unresolved`` 且定位为空。
     """
     source_results = {r.index: r for r in source.results}
     retry_results = {r.index: r for r in retry.results}
@@ -595,10 +669,11 @@ def _build_retry_outcome(
             before_code = before.code
             before_message = before.message
         else:
-            # 错误项及其后无结果项：沿用源任务保留的错误定位
+            # 错误项及其后无结果项沿用源任务错误定位；cancelled 源任务
+            # 全部项无结论且无失败定位，定位为空。
             before_status = ITEM_UNRESOLVED
-            before_stage, before_code, before_message = _error_location(
-                source.error
+            before_stage, before_code, before_message = _unresolved_location(
+                source
             )
 
         after = retry_results.get(index)
@@ -608,10 +683,11 @@ def _build_retry_outcome(
             after_code = after.code
             after_message = after.message
         else:
-            # 复核任务自身失败、该项尚无结果：沿用复核任务的错误定位
+            # 复核任务自身失败、该项尚无结果：沿用复核任务的错误定位；
+            # 复核任务被取消：无结论且定位为空。
             after_status = ITEM_UNRESOLVED
-            after_stage, after_code, after_message = _error_location(
-                retry.error
+            after_stage, after_code, after_message = _unresolved_location(
+                retry
             )
 
         if after_status == ITEM_PASSED:

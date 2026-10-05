@@ -234,7 +234,10 @@ TASK_QUEUED = "queued"
 TASK_PROCESSING = "processing"
 TASK_COMPLETED = "completed"
 TASK_FAILED = "failed"
-TASK_TERMINAL_STATUSES = (TASK_COMPLETED, TASK_FAILED)
+TASK_CANCELLED = "cancelled"
+# 不可逆的终态：completed/failed 持有终态结果，cancelled 未经验证即终结。
+# 三者都不可再被消费，且都可作为 retry_failed/retry_outcome 的源任务。
+TASK_TERMINAL_STATUSES = (TASK_COMPLETED, TASK_FAILED, TASK_CANCELLED)
 
 # 逐项验证的失败阶段（固定字面量，与单证验证流水线一一对应）
 ITEM_STAGE_PROOF_READ = "proof_read"
@@ -379,6 +382,33 @@ class TaskProgress:
             "total": self.total,
             "completed": self.completed,
             "result": None if self.result is None else self.result.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class TaskCancellationReceipt:
+    """取消成功的回执。
+
+    仅 ``queued`` 任务可取消：取消时任务未经验证即进入 ``cancelled``
+    终态，回执与 :meth:`progress` 同口径给出 ``total`` 与
+    ``completed=0``；``cancelled_item_ids`` 为全部入队项的标识，按任务
+    输入顺序排列。只承载定位信息，不含证明材料、``public_inputs``、
+    调用栈或未公开验证器信息。
+    """
+
+    task_id: str
+    status: str
+    total: int
+    completed: int
+    cancelled_item_ids: List[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "status": self.status,
+            "total": self.total,
+            "completed": self.completed,
+            "cancelled_item_ids": list(self.cancelled_item_ids),
         }
 
 
