@@ -118,6 +118,20 @@ class InvalidProofFormatError(TaskValidationError):
     """证明材料不满足公开格式约束（缺 ``proof`` 字段或其不是非空映射）。"""
 
 
+class InvalidPriorityError(TaskValidationError):
+    """``priority`` 不是 0 到 100 闭区间内的整数。
+
+    ``bool`` 不是整数（``True``/``False`` 同样非法）；提交校验中优先级
+    最后检查，非法时不生成任务标识、不进入队列，复核请求也不改变源任务。
+    """
+
+    def __init__(self, priority: object):
+        super().__init__(
+            f"priority must be an int in [0, 100], got {priority!r}"
+        )
+        self.priority = priority
+
+
 class TaskError(ZKBatchError):
     """任务队列相关异常的根。"""
 

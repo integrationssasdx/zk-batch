@@ -68,11 +68,23 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     `BatchSizeLimitError` → 按输入顺序逐项检查的 `InvalidItemIdError`
     （标识缺失/非非空字符串）与 `InvalidProofFormatError`
     （缺 `proof` 或不是非空映射）→ 同批重复标识 `DuplicateItemIdError`，
-    不混用其他异常。
-  - `run_next()` / `run_task(task_id)` 按输入顺序逐项验证。单个证明失败不
+    不混用其他异常；最后检查 `priority`，非法抛 `InvalidPriorityError`。
+    `priority` 只接受 0 到 100 闭区间内的整数（`bool` 不算整数），省略时
+    为 0；只作用于新任务，非法时不生成任务、不进入队列。
+  - `run_next()` / `run_task(task_id)` 逐项验证：`run_next()` 消费
+    **最高优先级**的 queued 任务（`priority` 数值越大越先消费，同值按
+    入队先后先入先出；取消或进入终态的任务不再参与排序），`run_task`
+    仍只消费指定的 queued 任务、不改动其他任务的位置。单个证明失败不
     中止同批其他项，每项只验证一次。`progress(task_id)` 返回
     `TaskProgress`：`status` 与真实 `completed`/`total` 进度，任务未结束时
     `result` 为 `None`，不提前给出最终结果。
+  - `schedule()` 返回只读的 `TaskScheduleReport`（固定键序 `to_dict`：
+    `queued_count`、`entries`）：`entries` 只含 queued 任务并按执行顺序
+    （优先级降序、同值按入队先后）排列，每条 `TaskScheduleEntry`（固定
+    键序 `to_dict`）含 `task_id`、`priority`、`queue_position`（从 1
+    开始）、`total`（等于条目数，报告 `queued_count` 同值）；空队列
+    返回 `queued_count=0`、`entries=[]`。重复查询不调用验证器、不消费、
+    不改变任何任务的状态或结果。
   - 终态结果 `result(task_id)` 返回 `BatchTaskResult`：`total`/`passed`/
     `failed`、与输入顺序一致的 `results`（每项含 `index` 输入序号、
     `item_id`、`status`（`passed`/`failed`）、`stage`、稳定 `code` 与供
@@ -114,7 +126,10 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     `run_next`/`run_task`/`status`/`progress`/`result`/`task_error`，每项只
     验证一次，`ItemResult.index` 与再次失败的定位都保留根任务下标；重复
     复核生成不同任务标识，源任务状态、结果与错误定位不变。`verifiers` 只
-    作用于新任务，省略时继承源任务的验证器选择。无可复核项抛
+    作用于新任务，省略时继承源任务的验证器选择。`priority` 同样只作用
+    于新任务：省略时继承源任务的优先级，显式值必须是 0-100 闭区间整数
+    （`bool` 不算），非法抛 `InvalidPriorityError`，不建任务也不改源
+    任务（在任务存在、已终结且确有可复核项之后才检查）。无可复核项抛
     `NoRetryableItemsError`，未知任务抛 `TaskNotFoundError`，queued 或
     processing 源任务抛 `TaskStateConflictError`，三者互不替代。
   - `retry_outcome(source_task_id, retry_task_id)` 只读对账复核结果，返回

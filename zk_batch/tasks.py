@@ -13,17 +13,23 @@
 
 * :meth:`VerificationTaskQueue.submit` 完成提交前校验并入队，返回
   :class:`TaskSubmission`（稳定任务标识、``queued`` 状态与批次摘要）。
-  校验失败（空批次/标识非法/超上限/材料格式不符/重复标识）直接抛出对应
-  异常，不生成任务标识、不进入队列。
+  校验失败（空批次/标识非法/超上限/材料格式不符/重复标识/优先级非法）
+  直接抛出对应异常，不生成任务标识、不进入队列。优先级为 0-100 的闭区间
+  整数（缺省 0），只作用于新任务；复核任务省略时继承源任务优先级。
 * :meth:`VerificationTaskQueue.cancel` 取消 queued 任务，返回
   :class:`TaskCancellationReceipt`；取消后的任务不再被
   :meth:`run_next`/:meth:`run_task` 消费、不调用验证器，查询只读：
   ``status`` 为 ``cancelled``，``progress`` 的 ``completed`` 为 0 且
   ``result`` 为 ``None``，``result`` 抛 :class:`TaskStateConflictError`，
   ``task_error`` 为 ``None``。
-* :meth:`run_next` 同步消费最早的 queued 任务；:meth:`run_task` 消费指定
-  任务。任务仅会被消费一次：处理中重复消费、终态后再次入队/消费均抛
-  :class:`TaskStateConflictError`。
+* :meth:`run_next` 同步消费优先级最高的 queued 任务（priority 高者先
+  消费，同值按入队先后先入先出）；:meth:`run_task` 消费指定任务，不
+  改变其他任务的位置。任务仅会被消费一次：处理中重复消费、终态后再次
+  入队/消费均抛 :class:`TaskStateConflictError`。
+* :meth:`schedule` 只读返回 :class:`TaskScheduleReport`：queued 任务按
+  执行顺序排列（优先级降序、入队先后），条目含 task_id、priority、
+  queue_position（1 起）与 total；空队列返回 queued_count=0。不调用
+  验证器、不消费、不改状态或结果，重复查询一致。
 * 处理过程中 :meth:`progress` 返回真实完成进度（``completed`` 为已结束
   项数），未结束时 ``result`` 为 ``None``，不提前给出最终结果。
 * 系统无法读取证明材料、验证器执行失败或无法保存最终结果时抛
@@ -32,7 +38,9 @@
 * :meth:`retry_failed` 从 completed/failed/cancelled 源任务挑出待复核
   项，按根任务输入顺序创建独立的 queued 任务（新任务标识，
   ``ItemResult.index`` 保留根任务下标）；cancelled 源任务的全部项均
-  未验证，整体按根顺序重排。源任务的状态、结果与错误定位不受影响。
+  未验证，整体按根顺序重排。新任务省略 ``priority`` 时继承源任务值，
+  显式值（0-100 整数，``bool`` 不算）只作用于新任务；源任务的状态、
+  结果、优先级与错误定位不受影响。
 * :meth:`retry_outcome` 只读对账复核结果：比对源任务与直接复核任务的
   终态结果，按根任务输入顺序给出每项复核前后的状态与唯一结论
   （recovered / still_failed / still_unresolved）。不调用验证器、不
@@ -62,6 +70,7 @@ from .errors import (
     DuplicateItemIdError,
     EmptyBatchError,
     InvalidItemIdError,
+    InvalidPriorityError,
     InvalidProofFormatError,
     NoRetryableItemsError,
     TaskLineageMismatchError,
@@ -82,6 +91,8 @@ from .models import (
     ITEM_STAGE_VERIFY,
     ITEM_UNRESOLVED,
     MAX_BATCH_ITEMS,
+    MAX_TASK_PRIORITY,
+    MIN_TASK_PRIORITY,
     OUTCOME_RECOVERED,
     OUTCOME_STILL_FAILED,
     OUTCOME_STILL_UNRESOLVED,
@@ -100,6 +111,8 @@ from .models import (
     TaskCancellationReceipt,
     TaskProgress,
     TaskRetrySubmission,
+    TaskScheduleEntry,
+    TaskScheduleReport,
     TaskSubmission,
 )
 
@@ -123,10 +136,14 @@ class _TaskRecord:
 
     def __init__(self, task_id: str, items: List[dict], verifiers: Any,
                  indexes: Optional[List[int]] = None,
-                 retried_from: Optional[str] = None):
+                 retried_from: Optional[str] = None,
+                 priority: int = MIN_TASK_PRIORITY):
         self.task_id = task_id
         self.items = items
         self.verifiers = verifiers
+        # 调度优先级（0-100 闭区间整数，缺省 0）；run_next 取最高优先级，
+        # 同值按 _tasks 的入队先后（OrderedDict 插入序）先入先出。
+        self.priority = priority
         # 每项在根任务输入中的零起下标；普通提交为恒等映射，复核任务
         # 保留源任务下标，使结果与再次失败的定位都指向最初提交。
         self.indexes: List[int] = (
@@ -167,7 +184,9 @@ class VerificationTaskQueue:
 
     # --------------------------------------------------------------- 提交
 
-    def submit(self, items: Any, verifiers: Any = None) -> TaskSubmission:
+    def submit(
+        self, items: Any, verifiers: Any = None, priority: Any = None
+    ) -> TaskSubmission:
         """完整校验一批验证项并入队，返回 :class:`TaskSubmission`。
 
         ``items`` 为非空的验证项序列，每项是含 ``item_id``（非空字符串）
@@ -179,16 +198,24 @@ class VerificationTaskQueue:
         :class:`BatchSizeLimitError` -> 按输入顺序逐项检查标识
         :class:`InvalidItemIdError` 与材料格式
         :class:`InvalidProofFormatError` -> 重复标识
-        :class:`DuplicateItemIdError`。
+        :class:`DuplicateItemIdError` -> ``priority``
+        :class:`InvalidPriorityError`。
+
+        ``priority`` 只接受 0 到 100 闭区间内的整数（``bool`` 不算整数）；
+        省略或为 ``None`` 时取 0。优先级只作用于新任务，不影响其他任务；
+        非法时不生成任务标识、不进入队列。
 
         ``verifiers`` 省略时使用构造队列时给定的默认验证器。
         """
         normalized = _validate_items(items)
+        resolved_priority = _validate_priority(priority)
         item_ids = [item["item_id"] for item in normalized]
 
         chosen = verifiers if verifiers is not None else self._default_verifiers
         task_id = f"task-{next(self._counter)}"
-        self._tasks[task_id] = _TaskRecord(task_id, normalized, chosen)
+        self._tasks[task_id] = _TaskRecord(
+            task_id, normalized, chosen, priority=resolved_priority
+        )
         return TaskSubmission(
             task_id=task_id,
             status=TASK_QUEUED,
@@ -230,7 +257,7 @@ class VerificationTaskQueue:
     # --------------------------------------------------------------- 复核
 
     def retry_failed(
-        self, task_id: str, verifiers: Any = None
+        self, task_id: str, verifiers: Any = None, priority: Any = None
     ) -> TaskRetrySubmission:
         """从终态源任务挑出待复核项，创建新的 queued 任务并返回
         :class:`TaskRetrySubmission`。
@@ -252,6 +279,11 @@ class VerificationTaskQueue:
 
         ``verifiers`` 只作用于新任务（解析与契约异常口径与
         :meth:`submit` 相同），省略时继承源任务的验证器选择。
+        ``priority`` 同样只作用于新任务：省略或为 ``None`` 时继承源任务
+        的优先级，显式给出时必须是 0 到 100 闭区间内的整数（``bool`` 不
+        算整数），非法时抛 :class:`InvalidPriorityError`，不建任务也不改
+        源任务。优先级沿用"最后校验"的次序：任务存在、已终结且确有可复
+        核项之后才检查。
 
         * 源任务不存在 ——:class:`TaskNotFoundError`；
         * 源任务为 queued/processing ——:class:`TaskStateConflictError`；
@@ -268,13 +300,17 @@ class VerificationTaskQueue:
             raise NoRetryableItemsError(
                 f"task {task_id!r} has no retryable items"
             )
+        inherited_priority = (
+            record.priority if priority is None else priority
+        )
+        resolved_priority = _validate_priority(inherited_priority)
         chosen = verifiers if verifiers is not None else record.verifiers
         positions = {index: pos for pos, index in enumerate(record.indexes)}
         items = [record.items[positions[index]] for index in selected]
         new_task_id = f"task-{next(self._counter)}"
         self._tasks[new_task_id] = _TaskRecord(
             new_task_id, items, chosen, indexes=selected,
-            retried_from=task_id,
+            retried_from=task_id, priority=resolved_priority,
         )
         return TaskRetrySubmission(
             source_task_id=task_id,
@@ -339,29 +375,28 @@ class VerificationTaskQueue:
     # --------------------------------------------------------------- 消费
 
     def run_next(self) -> Optional[BatchTaskResult]:
-        """消费最早的 queued 任务；没有可消费任务时返回 ``None``。
+        """消费最高优先级的 queued 任务；没有可消费任务时返回 ``None``。
 
-        处理中（如验证器回调内）再次调用本方法或 :meth:`run_task` 属于
-        重复消费/状态冲突，抛 :class:`TaskStateConflictError`。
-        基础设施错误以 :class:`VerificationInfrastructureError` 传播，
-        任务保留为 ``failed`` 终态且已完成项结果可查。
+        优先级为提交/复核时给定的 ``priority``（缺省 0）：数值越大越先
+        消费，同值按入队先后先入先出；处理中（如验证器回调内）再次调用
+        本方法或 :meth:`run_task` 属于重复消费/状态冲突，抛
+        :class:`TaskStateConflictError`。取消或进入终态的任务不再参与
+        排序。基础设施错误以 :class:`VerificationInfrastructureError`
+        传播，任务保留为 ``failed`` 终态且已完成项结果可查。
         """
         self._ensure_no_active_consumer()
-        task_id = None
-        for record in self._tasks.values():
-            if record.status == TASK_QUEUED:
-                task_id = record.task_id
-                break
-        if task_id is None:
+        next_record = self._next_queued()
+        if next_record is None:
             return None
-        return self._consume(task_id)
+        return self._consume(next_record.task_id)
 
     def run_task(self, task_id: str) -> BatchTaskResult:
         """消费指定任务并返回最终结果。
 
-        任务不存在抛 :class:`TaskNotFoundError`；任务不处于 queued
-        （处理中或已终态）抛 :class:`TaskStateConflictError`——终态后
-        再次入队/消费、重复消费统一走该异常。
+        只消费该指定任务，不按优先级挑选，也不改变其他 queued 任务的
+        相对位置。任务不存在抛 :class:`TaskNotFoundError`；任务不处于
+        queued （处理中或已终态）抛 :class:`TaskStateConflictError`——
+        终态后再次入队/消费、重复消费统一走该异常。
         """
         self._ensure_no_active_consumer()
         record = self._require_task(task_id)
@@ -420,6 +455,31 @@ class VerificationTaskQueue:
         不存在抛 :class:`TaskNotFoundError`。
         """
         return self._require_task(task_id).error
+
+    def schedule(self) -> TaskScheduleReport:
+        """返回只读调度快照 :class:`TaskScheduleReport`。
+
+        ``entries`` 只含 queued 任务并按执行顺序排列——``priority`` 高者
+        在前，同值按入队先后；``queue_position`` 从 1 开始，每条目的
+        ``total`` 等于条目数，报告的 ``queued_count`` 同为该值。空队列
+        返回 ``queued_count=0``、``entries`` 为空。终态（completed/failed/
+        cancelled）任务不参与。
+
+        本方法不调用验证器、不消费任务、不改变任何任务的状态或结果，
+        重复查询返回一致内容。
+        """
+        queued = self._queued_in_order()
+        total = len(queued)
+        entries = [
+            TaskScheduleEntry(
+                task_id=record.task_id,
+                priority=record.priority,
+                queue_position=position,
+                total=total,
+            )
+            for position, record in enumerate(queued, start=1)
+        ]
+        return TaskScheduleReport(queued_count=total, entries=entries)
 
     # --------------------------------------------------------------- 内部
 
@@ -570,6 +630,24 @@ class VerificationTaskQueue:
                 f"task {self._current!r} is already being consumed"
             )
 
+    def _queued_in_order(self) -> List[_TaskRecord]:
+        """全部 queued 任务按执行顺序排列：优先级降序，同值按入队先后。
+
+        ``_tasks`` 是按入队先后排列的 OrderedDict，稳定排序以优先级为
+        唯一键即可保持同值任务的相对入队次序。
+        """
+        queued = [
+            record for record in self._tasks.values()
+            if record.status == TASK_QUEUED
+        ]
+        queued.sort(key=lambda record: record.priority, reverse=True)
+        return queued
+
+    def _next_queued(self) -> Optional[_TaskRecord]:
+        """下一个将被 :meth:`run_next` 消费的 queued 任务；无则 ``None``。"""
+        ordered = self._queued_in_order()
+        return ordered[0] if ordered else None
+
     def _require_task(self, task_id: str) -> _TaskRecord:
         record = self._tasks.get(task_id)
         if record is None:
@@ -707,6 +785,21 @@ def _build_retry_outcome(
 
 
 # ============================================================ 提交前校验
+
+def _validate_priority(priority: Any) -> int:
+    """校验 ``priority``：``None`` 取缺省 0，否则必须是 0-100 的整数。
+
+    ``bool`` 是 ``int`` 的子类，但布尔值不是合法优先级，显式拒绝。
+    """
+    if priority is None:
+        return MIN_TASK_PRIORITY
+    # bool 必须先于 int 判断：True/False 在 Python 中也是 int 实例。
+    if isinstance(priority, bool) or not isinstance(priority, int):
+        raise InvalidPriorityError(priority)
+    if not (MIN_TASK_PRIORITY <= priority <= MAX_TASK_PRIORITY):
+        raise InvalidPriorityError(priority)
+    return priority
+
 
 def _validate_items(items: Any) -> List[dict]:
     """提交前完整输入校验；通过则返回原样保留的验证项列表。

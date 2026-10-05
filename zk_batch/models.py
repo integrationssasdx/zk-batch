@@ -229,6 +229,10 @@ class VerificationJob:
 # 单批验证项数量的公开上限
 MAX_BATCH_ITEMS = 1000
 
+# 任务优先级的公开闭区间
+MIN_TASK_PRIORITY = 0
+MAX_TASK_PRIORITY = 100
+
 # 任务状态
 TASK_QUEUED = "queued"
 TASK_PROCESSING = "processing"
@@ -406,6 +410,48 @@ class TaskProgress:
             "total": self.total,
             "completed": self.completed,
             "result": None if self.result is None else self.result.to_dict(),
+        }
+
+
+@dataclass(frozen=True)
+class TaskScheduleEntry:
+    """调度快照中的单个 queued 任务条目。
+
+    只承载调度定位信息：``task_id``、``priority``（0-100）与该任务在
+    当前执行顺序中的 ``queue_position``（1 起），以及该调度快照的条目
+    总数 ``total``。不含证明材料、``public_inputs``、调用栈或验证器信息。
+    """
+
+    task_id: str
+    priority: int
+    queue_position: int
+    total: int
+
+    def to_dict(self) -> dict:
+        return {
+            "task_id": self.task_id,
+            "priority": self.priority,
+            "queue_position": self.queue_position,
+            "total": self.total,
+        }
+
+
+@dataclass(frozen=True)
+class TaskScheduleReport:
+    """只读调度快照：queued 任务按执行顺序（优先级降序、入队先后）排列。
+
+    ``entries`` 只含 queued 任务，终态任务不参与；``queued_count`` 等于
+    ``len(entries)``，每条目的 ``total`` 与之相同。重复查询不调用验证器、
+    不消费任务、不改变任何状态或结果。
+    """
+
+    queued_count: int
+    entries: List[TaskScheduleEntry]
+
+    def to_dict(self) -> dict:
+        return {
+            "queued_count": self.queued_count,
+            "entries": [entry.to_dict() for entry in self.entries],
         }
 
 
