@@ -17,6 +17,10 @@
    * 聚合验证返回 False 或抛异常 ——按原序回退单证验证，
      单证 False 记 rejected、抛异常记 verify_error（stage=single_verify）；
      若单证全部通过但整组失败，按聚合阶段归责到组内每证。
+
+:func:`verify_batch_windowed` 复用同一条流水线：先校验 ``max_group_size``
+（非法抛 InvalidAggregationLimitError，不调用验证器），再把每个分组按源序
+切成不超过该容量的连续窗口，逐窗聚合验证、窗内回退。
 """
 
 from __future__ import annotations
@@ -29,6 +33,7 @@ from .errors import (
     DuplicateProofIdError,
     EmptyBatchError,
     IncompatibleAggregationError,
+    InvalidAggregationLimitError,
     InvalidProofError,
     UnsupportedProofSystemError,
     VerifierContractError,
@@ -42,6 +47,7 @@ from .models import (
     AGG_VERIFY_REJECTED,
     CODE_REJECTED,
     CODE_VERIFY_ERROR,
+    MAX_BATCH_ITEMS,
     SINGLE_NOT_RUN,
     SINGLE_PASSED,
     SINGLE_REJECTED,
@@ -56,6 +62,8 @@ from .models import (
     GroupVerificationReport,
     Proof,
     ProofVerificationDetail,
+    WindowVerificationReport,
+    WindowedBatchVerificationReport,
 )
 from .verifier import ZKVerifier
 
@@ -89,6 +97,96 @@ def verify_batch_detailed(batch: Any, verifiers: Any) -> BatchVerificationReport
     报告中的 ``result`` 与 :func:`verify_batch` 的返回值同值。
     """
     return _run_pipeline(batch, verifiers).report
+
+
+def verify_batch_windowed(
+    batch: Any, verifiers: Any, max_group_size: int
+) -> WindowedBatchVerificationReport:
+    """按聚合容量窗口化验证一个批次，返回 :class:`WindowedBatchVerificationReport`。
+
+    参数与 :func:`verify_batch` 相同，仅新增 ``max_group_size``：每个
+    (protocol, circuit_id, aggregation_key) 分组按源序切成不超过
+    ``max_group_size`` 的连续窗口（末窗可短），不重排、不混组；逐窗走与
+    详细流水线完全相同的聚合验证与窗内按序回退。``max_group_size`` 必须是
+    1 到 ``MAX_BATCH_ITEMS`` 的整数（``bool`` 不算），否则抛
+    :class:`InvalidAggregationLimitError` 且不调用任何验证器方法。
+
+    空批次、字段错误、重复 ``proof_id``、未知 protocol、验证器契约违约抛
+    出与批量入口相同的异常；``aggregate`` 抛
+    :class:`IncompatibleAggregationError` 时异常仍向调用方传播，抛其他
+    异常时按该窗聚合失败定位。报告的 ``result`` 中 ``aggregate_count``
+    等于窗口数，``passed``/``failed``/``failures`` 按证明计数。
+    """
+    _validate_max_group_size(max_group_size)
+    batch_id, raw_proofs = _validate_batch(batch)
+    proofs = _normalize_proofs(raw_proofs)
+    _ensure_unique_ids(proofs)
+
+    groups = _group_proofs(proofs)
+    protocol_map = _resolve_verifiers(verifiers)
+
+    failures: List[Failure] = []
+    windows: List[WindowVerificationReport] = []
+    for key, members in groups:
+        # 与批量入口一致的逐组解析顺序：不能聚合(前一窗) -> 未知系统(后一组)
+        # -> 契约违约（调用点惰性暴露）。
+        verifier = protocol_map.get(key[0])
+        if verifier is None:
+            raise UnsupportedProofSystemError(key[0])
+        group_id = f"{key[0]}:{key[1]}:{key[2]}"
+        for window_index, window_members in enumerate(
+            _split_windows(members, max_group_size), start=1
+        ):
+            window_failures, group_report = _verify_group(
+                key, window_members, verifier
+            )
+            failures.extend(window_failures)
+            windows.append(
+                WindowVerificationReport(
+                    group_id=group_id,
+                    window_index=window_index,
+                    proof_ids=group_report.proof_ids,
+                    aggregate_call_status=group_report.aggregate_call_status,
+                    aggregate_verify_status=(
+                        group_report.aggregate_verify_status
+                    ),
+                    fell_back=group_report.fell_back,
+                    proofs=group_report.proofs,
+                )
+            )
+
+    # failures 按 proof_id 排序沿用批量入口的对外结果契约。
+    failures.sort(key=lambda f: f.proof_id)
+    total = len(proofs)
+    failed = len(failures)
+    result = BatchVerificationResult(
+        batch_id=batch_id,
+        aggregate_count=len(windows),
+        passed=total - failed,
+        failed=failed,
+        failures=failures,
+    )
+    return WindowedBatchVerificationReport(result=result, windows=windows)
+
+
+def _validate_max_group_size(max_group_size: Any) -> None:
+    """``max_group_size`` 必须是 [1, MAX_BATCH_ITEMS] 的整数；bool 不算。"""
+    if (
+        isinstance(max_group_size, bool)
+        or not isinstance(max_group_size, int)
+        or not 1 <= max_group_size <= MAX_BATCH_ITEMS
+    ):
+        raise InvalidAggregationLimitError(max_group_size)
+
+
+def _split_windows(
+    members: List[Proof], max_group_size: int
+) -> List[List[Proof]]:
+    """按源序切成不超过 ``max_group_size`` 的连续窗口；末窗可短。"""
+    return [
+        members[i:i + max_group_size]
+        for i in range(0, len(members), max_group_size)
+    ]
 
 
 @dataclass

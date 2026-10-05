@@ -5,6 +5,8 @@
 * :func:`verify_batch` —— 按分组键聚合验证，失败回退单证验证。
 * :func:`verify_batch_detailed` —— 同流水线的详细报告入口，
   返回 :class:`BatchVerificationReport`。
+* :func:`verify_batch_windowed` —— 受聚合容量约束的窗口化验证，
+  返回 :class:`WindowedBatchVerificationReport`。
 * :class:`VerificationQueue` —— 分组聚合的串行作业队列。
 * :class:`VerificationTaskQueue` —— 可排队、可定位失败原因的逐项验证队列。
 * :class:`ZKVerifier` —— 用户实现具体证明系统时继承的契约基类。
@@ -19,6 +21,7 @@ from .errors import (
     EmptyBatchError,
     GroupReverifyLineageMismatchError,
     IncompatibleAggregationError,
+    InvalidAggregationLimitError,
     InvalidGroupSelectionError,
     InvalidItemIdError,
     InvalidPriorityError,
@@ -66,15 +69,18 @@ from .models import (
     TaskScheduleReport,
     TaskSubmission,
     VerificationJob,
+    WindowVerificationReport,
+    WindowedBatchVerificationReport,
 )
 from .queue import VerificationQueue
 from .tasks import VerificationTaskQueue
 from .verifier import ZKVerifier
-from .engine import verify_batch, verify_batch_detailed
+from .engine import verify_batch, verify_batch_detailed, verify_batch_windowed
 
 __all__ = [
     "verify_batch",
     "verify_batch_detailed",
+    "verify_batch_windowed",
     "VerificationQueue",
     "VerificationTaskQueue",
     "ZKVerifier",
@@ -82,6 +88,8 @@ __all__ = [
     "Failure",
     "BatchVerificationResult",
     "BatchVerificationReport",
+    "WindowedBatchVerificationReport",
+    "WindowVerificationReport",
     "GroupVerificationReport",
     "ProofVerificationDetail",
     "VerificationJob",
@@ -109,6 +117,7 @@ __all__ = [
     "InvalidProofError",
     "DuplicateProofIdError",
     "IncompatibleAggregationError",
+    "InvalidAggregationLimitError",
     "UnsupportedProofSystemError",
     "VerifierContractError",
     "RunningJobError",

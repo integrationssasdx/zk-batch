@@ -45,6 +45,21 @@ class VerifierContractError(ZKBatchError):
     """验证器缺方法，或其返回值不是布尔。"""
 
 
+class InvalidAggregationLimitError(ZKBatchError):
+    """``max_group_size`` 不是 1 到 ``MAX_BATCH_ITEMS`` 的整数。
+
+    ``bool`` 不是整数（``True``/``False`` 同样非法）；检出非法时不调用
+    任何验证器方法。
+    """
+
+    def __init__(self, limit: object):
+        super().__init__(
+            f"max_group_size must be an int in [1, MAX_BATCH_ITEMS], "
+            f"got {limit!r}"
+        )
+        self.limit = limit
+
+
 # ---------------------------------------------------------------- 队列阶段
 
 class QueueError(ZKBatchError):

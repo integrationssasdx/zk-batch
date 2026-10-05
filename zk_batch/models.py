@@ -213,6 +213,55 @@ class BatchVerificationReport:
         }
 
 
+@dataclass(frozen=True)
+class WindowVerificationReport:
+    """单个聚合窗口的详细报告；窗内明细按批次原序。
+
+    ``window_index`` 为该窗口在其分组内的序号（1 起）；其余字段与
+    :class:`GroupVerificationReport` 同义，只是作用范围是窗口而非整组。
+    不承载 ``proof`` 与 ``public_inputs`` 内容。
+    """
+
+    group_id: str
+    window_index: int
+    proof_ids: List[str]
+    aggregate_call_status: str
+    aggregate_verify_status: str
+    fell_back: bool
+    proofs: List[ProofVerificationDetail]
+
+    def to_dict(self) -> dict:
+        return {
+            "group_id": self.group_id,
+            "window_index": self.window_index,
+            "proof_ids": list(self.proof_ids),
+            "aggregate_call_status": self.aggregate_call_status,
+            "aggregate_verify_status": self.aggregate_verify_status,
+            "fell_back": self.fell_back,
+            "proofs": [p.to_dict() for p in self.proofs],
+        }
+
+
+@dataclass(frozen=True)
+class WindowedBatchVerificationReport:
+    """窗口化批量验证的详细报告。
+
+    ``result`` 为 :class:`BatchVerificationResult`：``batch_id`` 原样回填，
+    ``aggregate_count`` 等于窗口数，``passed``/``failed``/``failures``
+    按证明计数。``windows`` 按分组首次出现序与组内窗序排列，窗内证明
+    保持批次原序。
+    """
+
+    result: BatchVerificationResult
+    windows: List[WindowVerificationReport]
+
+    def to_dict(self) -> dict:
+        return {
+            "result": self.result.to_dict(),
+            "windows": [w.to_dict() for w in self.windows],
+        }
+
+
 @dataclass
 class VerificationJob:
     """队列中的一个验证作业。"""
