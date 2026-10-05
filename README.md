@@ -27,6 +27,31 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     `异常类型名: str(exc)`（`str(exc)` 为空时只保留类型名）。
   - 消息中不包含 `proof` 与 `public_inputs` 内容；各模型均提供固定键序的
     `to_dict()`。
+- `verify_batch_windowed(batch, verifiers, max_group_size)` —— 受聚合容量
+  约束的窗口化验证，参数同批量入口、仅新增 `max_group_size`，返回
+  `WindowedBatchVerificationReport`：
+  - 先按 `(protocol, circuit_id, aggregation_key)` 分组（分组按首次出现
+    序、组内保持批次原序，不重排、不混组），再把每组按源序切成不超过
+    `max_group_size` 的连续窗口；末窗可短，组内 `window_index` 从 1 起
+    连续编号。`proofs` 保持输入原序，`proof_id` 全批唯一。
+  - 每个窗口独立复用详细流水线与单证语义：`aggregate` 与
+    `verify_aggregate` 只收窗内证明；聚合验证失败仅在窗内按序回退单证
+    验证。
+  - `result` 为 `BatchVerificationResult`：`batch_id` 原样回填，
+    `aggregate_count` 等于窗口总数，`passed`/`failed`/`failures` 均按
+    证明计数并沿用 `Failure`。
+  - `windows` 按分组首次出现序、组内按窗序排列；每项
+    （`WindowVerificationReport`，固定键序 `to_dict`）含 `group_id`、
+    `window_index`、窗内按原序的 `proof_ids`、`aggregate_call_status`、
+    `aggregate_verify_status`、`fell_back` 与逐证
+    `ProofVerificationDetail`；不含 `proof` 与 `public_inputs`。
+  - `max_group_size` 必须是 1 到 `MAX_BATCH_ITEMS` 闭区间内的整数
+    （`bool` 不算整数），否则抛 `InvalidAggregationLimitError`，且不解析、
+    不调用任何验证器。空批次、字段错误、重复 `proof_id`、未知 protocol、
+    契约违约沿用原异常；某窗口 `aggregate` 抛 `IncompatibleAggregationError`
+    时异常向调用方传播，其他聚合异常按该窗口 `aggregate` 失败定位到窗内
+    每证，单证拒绝与异常沿用既有 `code`。既有入口与队列的
+    result/report、`reverify_failures`、`reverify_groups` 与对账均不变。
 - `VerificationQueue` —— 内存中的串行作业队列，不起线程、不联网、不落盘。
   作业执行时一次走完整的详细验证流水线并保存报告：
   - `result(job_id)` 返回该次执行的 `BatchVerificationResult`；

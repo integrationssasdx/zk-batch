@@ -213,6 +213,56 @@ class BatchVerificationReport:
         }
 
 
+@dataclass(frozen=True)
+class WindowVerificationReport:
+    """窗口化验证中单个聚合窗口的详细报告。
+
+    字段语义与 :class:`GroupVerificationReport` 相同，另在 ``group_id``
+    之后携带从 1 起、组内连续编号的 ``window_index``。``proof_ids`` 为
+    该窗内证明按批次原序的标识；``proofs`` 为同序的
+    :class:`ProofVerificationDetail`。不含 ``proof`` 与 ``public_inputs``。
+    """
+
+    group_id: str
+    window_index: int
+    proof_ids: List[str]
+    aggregate_call_status: str
+    aggregate_verify_status: str
+    fell_back: bool
+    proofs: List[ProofVerificationDetail]
+
+    def to_dict(self) -> dict:
+        return {
+            "group_id": self.group_id,
+            "window_index": self.window_index,
+            "proof_ids": list(self.proof_ids),
+            "aggregate_call_status": self.aggregate_call_status,
+            "aggregate_verify_status": self.aggregate_verify_status,
+            "fell_back": self.fell_back,
+            "proofs": [p.to_dict() for p in self.proofs],
+        }
+
+
+@dataclass(frozen=True)
+class WindowedBatchVerificationReport:
+    """``verify_batch_windowed`` 的窗口化验证报告。
+
+    ``result`` 为 :class:`BatchVerificationResult`，``batch_id`` 原样回填，
+    ``aggregate_count`` 等于窗口总数；``passed``/``failed``/``failures``
+    均按证明计数，沿用 :class:`Failure`。``windows`` 按分组首次出现序、
+    组内按窗序排列，窗内证明保持批次原序。
+    """
+
+    result: BatchVerificationResult
+    windows: List[WindowVerificationReport]
+
+    def to_dict(self) -> dict:
+        return {
+            "result": self.result.to_dict(),
+            "windows": [w.to_dict() for w in self.windows],
+        }
+
+
 @dataclass
 class VerificationJob:
     """队列中的一个验证作业。"""

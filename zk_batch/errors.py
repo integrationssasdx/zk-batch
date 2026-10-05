@@ -41,6 +41,23 @@ class UnsupportedProofSystemError(ZKBatchError):
         self.protocol = protocol
 
 
+class InvalidAggregationLimitError(ZKBatchError):
+    """``verify_batch_windowed`` 的 ``max_group_size`` 非法。
+
+    必须是 1 到 :data:`~zk_batch.models.MAX_BATCH_ITEMS` 闭区间内的整数，
+    ``bool`` 不算整数（``True``/``False`` 同样非法）。该错误在任何验证器
+    调用之前抛出。
+    """
+
+    def __init__(self, max_group_size: object, limit: int):
+        super().__init__(
+            "max_group_size must be an int in "
+            f"[1, {limit}], got {max_group_size!r}"
+        )
+        self.max_group_size = max_group_size
+        self.limit = limit
+
+
 class VerifierContractError(ZKBatchError):
     """验证器缺方法，或其返回值不是布尔。"""
 
