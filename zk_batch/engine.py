@@ -29,14 +29,21 @@ from .errors import (
     DuplicateProofIdError,
     EmptyBatchError,
     IncompatibleAggregationError,
+    InvalidAggregationGroupSelectionError,
     InvalidAggregationLimitError,
     InvalidProofError,
     UnsupportedProofSystemError,
+    UnknownAggregationGroupError,
     VerifierContractError,
 )
 from .models import (
     AGG_CALL_ERROR,
     AGG_CALL_SUCCEEDED,
+    AGG_CONFLICT_HIGHER_ORDER,
+    AGG_CONFLICT_NO_CONFLICT,
+    AGG_CONFLICT_PAIR,
+    AGG_CONFLICT_SINGLE,
+    AGG_CONFLICT_SCOPE_NONE,
     AGG_VERIFY_ERROR,
     AGG_VERIFY_NOT_RUN,
     AGG_VERIFY_PASSED,
@@ -51,6 +58,7 @@ from .models import (
     STAGE_AGGREGATE,
     STAGE_AGGREGATE_VERIFY,
     STAGE_SINGLE_VERIFY,
+    AggregationConflictReport,
     BatchVerificationReport,
     BatchVerificationResult,
     Failure,
@@ -168,6 +176,163 @@ def verify_batch_windowed(
     return WindowedBatchVerificationReport(
         result=result, windows=window_reports
     )
+
+
+def diagnose_aggregation_conflict(
+    batch: Any, verifiers: Any, group_id: str
+) -> AggregationConflictReport:
+    """定位单个聚合组内的聚合冲突，返回
+    :class:`AggregationConflictReport`。
+
+    参数 ``batch``、``verifiers`` 与 :func:`verify_batch` 同口径：批次
+    校验优先级（空批次、字段错误、重复 ``proof_id``）与既有入口完全
+    一致。``group_id`` 必须是非空字符串，否则抛
+    :class:`InvalidAggregationGroupSelectionError`；合法但批次中不存在
+    该聚合组时抛 :class:`UnknownAggregationGroupError`。这两类检查在
+    任何验证器解析与 ``aggregate`` 调用之前完成。
+
+    定位过程只调用选中组验证器的 ``aggregate``：不调用
+    ``verify_aggregate`` 与 ``verify``，也不判断证明是否有效。依次
+    检查单证、两两组合、整组三个层级，每层无冲突才进入下一层；
+    集合内 ``proof_id`` 保持批次原序，两两组合按两个位置的源序排列，
+    组合之间按字典序（源序下标）枚举。``aggregate`` 抛
+    :class:`IncompatibleAggregationError` 时记录该集合为冲突集合，
+    抛其他异常时原样传播（不包装、不吞并）。
+
+    无冲突时 ``status`` 为 ``no_conflict``、``scope`` 为 ``none``，
+    ``conflict_sets`` 与 ``conflicted_proof_ids`` 均为空；单证、两证、
+    整组首次检出的冲突层分别记 ``single``/``pair``/``higher_order``，
+    后者的 ``conflict_sets`` 只含整组 ``proof_ids``。
+
+    诊断只读 ``batch``：不修改批次、不落盘、不起线程、不联网；报告不
+    包含 ``proof``、``public_inputs``、调用栈或验证器内部信息。验证器
+    行为稳定时，对相同输入重复诊断得到同值报告。
+    """
+    _batch_id, raw_proofs = _validate_batch(batch)
+    proofs = _normalize_proofs(raw_proofs)
+    _ensure_unique_ids(proofs)
+
+    groups = _group_proofs(proofs)
+    _validate_group_id(group_id)
+    selected = _select_group_members(groups, group_id)
+
+    protocol_map = _resolve_verifiers(verifiers)
+    verifier = protocol_map.get(selected[0].protocol)
+    if verifier is None:
+        raise UnsupportedProofSystemError(selected[0].protocol)
+    # 诊断只需要 aggregate：缺方法/未实现按 VerifierContractError 抛出，
+    # 与既有入口的契约优先级一致。
+    _require_method(verifier, "aggregate")
+
+    proof_ids = [proof.proof_id for proof in selected]
+    return _locate_conflicts(group_id, proof_ids, selected, verifier)
+
+
+def _validate_group_id(group_id: Any) -> None:
+    """group_id 必须是非空字符串；非法时不解析验证器、不调用 aggregate。"""
+    if not isinstance(group_id, str) or not group_id:
+        raise InvalidAggregationGroupSelectionError(group_id)
+
+
+def _select_group_members(
+    groups: List[Tuple[GroupKey, List[Proof]]], group_id: str
+) -> List[Proof]:
+    """按 group_id 选取分组；不存在抛 UnknownAggregationGroupError。"""
+    for key, members in groups:
+        if f"{key[0]}:{key[1]}:{key[2]}" == group_id:
+            return members
+    raise UnknownAggregationGroupError(group_id)
+
+
+def _locate_conflicts(
+    group_id: str,
+    proof_ids: List[str],
+    members: List[Proof],
+    verifier: ZKVerifier,
+) -> AggregationConflictReport:
+    """逐层调用 aggregate 定位冲突。
+
+    每层枚举保持批次原序：单证按下标；两两组合按下标字典序（两个位置
+    的源序排列）；整组只聚合一次。每层记录全部冲突集合，仅当本层无
+    冲突才进入下一层。
+    """
+    # ---- 第一层：单证 ---------------------------------------------------
+    single_sets = _aggregate_probe_sets(
+        [[proof] for proof in members], verifier
+    )
+    if single_sets:
+        return AggregationConflictReport(
+            group_id=group_id,
+            proof_ids=proof_ids,
+            status=AGG_CONFLICT_SINGLE,
+            scope=AGG_CONFLICT_SINGLE,
+            conflict_sets=single_sets,
+            conflicted_proof_ids=_conflicted_in_order(proof_ids, single_sets),
+        )
+
+    # ---- 第二层：两两组合（按两个位置的源序排列）-----------------------
+    pairs: List[List[Proof]] = [
+        [members[i], members[j]]
+        for i in range(len(members))
+        for j in range(i + 1, len(members))
+    ]
+    pair_sets = _aggregate_probe_sets(pairs, verifier)
+    if pair_sets:
+        return AggregationConflictReport(
+            group_id=group_id,
+            proof_ids=proof_ids,
+            status=AGG_CONFLICT_PAIR,
+            scope=AGG_CONFLICT_PAIR,
+            conflict_sets=pair_sets,
+            conflicted_proof_ids=_conflicted_in_order(proof_ids, pair_sets),
+        )
+
+    # ---- 第三层：整组 ---------------------------------------------------
+    group_sets = _aggregate_probe_sets([members], verifier)
+    if group_sets:
+        return AggregationConflictReport(
+            group_id=group_id,
+            proof_ids=proof_ids,
+            status=AGG_CONFLICT_HIGHER_ORDER,
+            scope=AGG_CONFLICT_HIGHER_ORDER,
+            conflict_sets=[list(proof_ids)],
+            conflicted_proof_ids=_conflicted_in_order(proof_ids, group_sets),
+        )
+
+    return AggregationConflictReport(
+        group_id=group_id,
+        proof_ids=proof_ids,
+        status=AGG_CONFLICT_NO_CONFLICT,
+        scope=AGG_CONFLICT_SCOPE_NONE,
+        conflict_sets=[],
+        conflicted_proof_ids=[],
+    )
+
+
+def _aggregate_probe_sets(
+    probe_sets: List[List[Proof]],
+    verifier: ZKVerifier,
+) -> List[List[str]]:
+    """按序对每个探针集合调用一次 ``aggregate``。
+
+    抛 IncompatibleAggregationError 记为冲突集合；抛其他异常原样传播。
+    返回的标识集合保持枚举顺序，集合内保持批次原序。
+    """
+    conflicts: List[List[str]] = []
+    for probe in probe_sets:
+        try:
+            verifier.aggregate(probe)
+        except IncompatibleAggregationError:
+            conflicts.append([proof.proof_id for proof in probe])
+    return conflicts
+
+
+def _conflicted_in_order(
+    proof_ids: List[str], sets: List[List[str]]
+) -> List[str]:
+    """按组内批次原序（``proof_ids``）合并去重冲突集合中的标识。"""
+    involved = {proof_id for conflict_set in sets for proof_id in conflict_set}
+    return [proof_id for proof_id in proof_ids if proof_id in involved]
 
 
 @dataclass

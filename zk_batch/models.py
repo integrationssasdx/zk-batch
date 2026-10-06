@@ -263,6 +263,49 @@ class WindowedBatchVerificationReport:
         }
 
 
+# ============================================================ 聚合冲突诊断
+
+# 诊断状态（固定字面量）
+AGG_CONFLICT_NO_CONFLICT = "no_conflict"
+AGG_CONFLICT_SINGLE = "single"
+AGG_CONFLICT_PAIR = "pair"
+AGG_CONFLICT_HIGHER_ORDER = "higher_order"
+
+# 定位到的最高冲突层；无冲突时为 none
+AGG_CONFLICT_SCOPE_NONE = "none"
+
+
+@dataclass(frozen=True)
+class AggregationConflictReport:
+    """``diagnose_aggregation_conflict`` 的只读冲突定位报告。
+
+    逐层（单证、两两组合、整组）调用 ``aggregate`` 定位冲突；
+    ``conflict_sets`` 保存首个检出冲突层的冲突集合（单证层为单证
+    ``proof_id``、两两层为成对 ``proof_id``、整组层只含整组
+    ``proof_ids``），集合内与集合间均保持批次原序。
+    ``conflicted_proof_ids`` 按组内批次原序合并去重。只承载定位信息，
+    不含 ``proof`` 与 ``public_inputs``。
+    """
+
+    group_id: str
+    proof_ids: List[str]
+    status: str
+    scope: str
+    conflict_sets: List[List[str]]
+    conflicted_proof_ids: List[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "group_id": self.group_id,
+            "proof_ids": list(self.proof_ids),
+            "status": self.status,
+            "scope": self.scope,
+            "conflict_sets": [list(conflict_set)
+                              for conflict_set in self.conflict_sets],
+            "conflicted_proof_ids": list(self.conflicted_proof_ids),
+        }
+
+
 @dataclass
 class VerificationJob:
     """队列中的一个验证作业。"""

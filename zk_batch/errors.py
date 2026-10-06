@@ -58,6 +58,33 @@ class InvalidAggregationLimitError(ZKBatchError):
         self.limit = limit
 
 
+class InvalidAggregationGroupSelectionError(ZKBatchError):
+    """``diagnose_aggregation_conflict`` 的 ``group_id`` 非法。
+
+    ``group_id`` 必须是非空字符串；检出非法时不解析验证器、不调用
+    ``aggregate``。
+    """
+
+    def __init__(self, group_id: object):
+        super().__init__(
+            f"group_id must be a non-empty str, got {group_id!r}"
+        )
+        self.group_id = group_id
+
+
+class UnknownAggregationGroupError(ZKBatchError):
+    """``group_id`` 合法但批次中不存在该聚合组。
+
+    批次实际分组为 ``(protocol, circuit_id, aggregation_key)`` 三元组
+    拼成的 ``protocol:circuit_id:aggregation_key`` 标识；选中的标识不在
+    其中时抛出，抛出前不解析验证器、不调用 ``aggregate``。
+    """
+
+    def __init__(self, group_id: str):
+        super().__init__(f"unknown aggregation group: {group_id!r}")
+        self.group_id = group_id
+
+
 class VerifierContractError(ZKBatchError):
     """验证器缺方法，或其返回值不是布尔。"""
 

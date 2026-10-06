@@ -5,6 +5,8 @@
 * :func:`verify_batch` —— 按分组键聚合验证，失败回退单证验证。
 * :func:`verify_batch_detailed` —— 同流水线的详细报告入口，
   返回 :class:`BatchVerificationReport`。
+* :func:`diagnose_aggregation_conflict` —— 只读定位单个聚合组的
+  聚合冲突，返回 :class:`AggregationConflictReport`。
 * :class:`VerificationQueue` —— 分组聚合的串行作业队列。
 * :class:`VerificationTaskQueue` —— 可排队、可定位失败原因的逐项验证队列。
 * :class:`ZKVerifier` —— 用户实现具体证明系统时继承的契约基类。
@@ -19,6 +21,7 @@ from .errors import (
     EmptyBatchError,
     GroupReverifyLineageMismatchError,
     IncompatibleAggregationError,
+    InvalidAggregationGroupSelectionError,
     InvalidAggregationLimitError,
     InvalidGroupSelectionError,
     InvalidItemIdError,
@@ -33,6 +36,7 @@ from .errors import (
     TaskLineageMismatchError,
     TaskNotFoundError,
     TaskStateConflictError,
+    UnknownAggregationGroupError,
     UnknownFailedGroupError,
     UnknownJobError,
     UnsupportedProofSystemError,
@@ -40,6 +44,7 @@ from .errors import (
     VerifierContractError,
 )
 from .models import (
+    AggregationConflictReport,
     BatchSummary,
     BatchVerificationReport,
     BatchVerificationResult,
@@ -73,17 +78,24 @@ from .models import (
 from .queue import VerificationQueue
 from .tasks import VerificationTaskQueue
 from .verifier import ZKVerifier
-from .engine import verify_batch, verify_batch_detailed, verify_batch_windowed
+from .engine import (
+    diagnose_aggregation_conflict,
+    verify_batch,
+    verify_batch_detailed,
+    verify_batch_windowed,
+)
 
 __all__ = [
     "verify_batch",
     "verify_batch_detailed",
     "verify_batch_windowed",
+    "diagnose_aggregation_conflict",
     "VerificationQueue",
     "VerificationTaskQueue",
     "ZKVerifier",
     "Proof",
     "Failure",
+    "AggregationConflictReport",
     "BatchVerificationResult",
     "BatchVerificationReport",
     "GroupVerificationReport",
@@ -117,6 +129,8 @@ __all__ = [
     "IncompatibleAggregationError",
     "UnsupportedProofSystemError",
     "VerifierContractError",
+    "InvalidAggregationGroupSelectionError",
+    "UnknownAggregationGroupError",
     "InvalidAggregationLimitError",
     "RunningJobError",
     "CompletedJobError",
