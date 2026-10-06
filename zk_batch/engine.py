@@ -29,8 +29,10 @@ from .errors import (
     DuplicateProofIdError,
     EmptyBatchError,
     IncompatibleAggregationError,
+    InvalidAggregationGroupSelectionError,
     InvalidAggregationLimitError,
     InvalidProofError,
+    UnknownAggregationGroupError,
     UnsupportedProofSystemError,
     VerifierContractError,
 )
@@ -43,6 +45,14 @@ from .models import (
     AGG_VERIFY_REJECTED,
     CODE_REJECTED,
     CODE_VERIFY_ERROR,
+    CONFLICT_HIGHER_ORDER,
+    CONFLICT_NO_CONFLICT,
+    CONFLICT_PAIR,
+    CONFLICT_SCOPE_HIGHER_ORDER,
+    CONFLICT_SCOPE_NONE,
+    CONFLICT_SCOPE_PAIR,
+    CONFLICT_SCOPE_SINGLE,
+    CONFLICT_SINGLE,
     MAX_BATCH_ITEMS,
     SINGLE_NOT_RUN,
     SINGLE_PASSED,
@@ -51,6 +61,7 @@ from .models import (
     STAGE_AGGREGATE,
     STAGE_AGGREGATE_VERIFY,
     STAGE_SINGLE_VERIFY,
+    AggregationConflictReport,
     BatchVerificationReport,
     BatchVerificationResult,
     Failure,
@@ -176,6 +187,148 @@ class _PipelineOutput:
 
     result: BatchVerificationResult
     report: BatchVerificationReport
+
+
+def diagnose_aggregation_conflict(
+    batch: Any, verifiers: Any, group_id: Any
+) -> AggregationConflictReport:
+    """定位单个聚合组内的聚合冲突，返回
+    :class:`AggregationConflictReport`。
+
+    ``batch``、``verifiers`` 与 :func:`verify_batch` 同源：先走完全相同的
+    批次校验（空批次、字段错误、重复 ``proof_id`` 优先级不变），再按
+    (protocol, circuit_id, aggregation_key) 分组。``group_id`` 必须是非
+    空字符串，否则抛 :class:`InvalidAggregationGroupSelectionError`；合法
+    但批次中不存在该组抛 :class:`UnknownAggregationGroupError`；两种情况
+    都不解析结果之外的验证器调用，更不调用 ``aggregate``。组的 protocol
+    无验证器抛 :class:`UnsupportedProofSystemError`，验证器缺 ``aggregate``
+    等契约违约抛 :class:`VerifierContractError`。
+
+    定位过程只调用 ``aggregate``，不调用 ``verify_aggregate`` 或
+    ``verify``，也不判断返回值的有效性：依次检查单证、两两组合、整组，
+    每层无冲突才进入下一层。集合内 ``proof_id`` 保持批次原序，两两组合
+    按两个位置的源序（``i<j``）排列。``aggregate`` 抛
+    :class:`IncompatibleAggregationError` 记为该层级的冲突，其他异常原样
+    传播。无冲突时 ``status`` 为 ``no_conflict``、``scope`` 为 ``none``；
+    单证/两证/整组冲突依次记 ``single``/``pair``/``higher_order``，
+    ``higher_order`` 的 ``conflict_sets`` 只含整组 ``proof_ids``。
+
+    诊断是只读操作：不改变 ``batch``、不落盘、不起线程、不联网；报告只
+    承载标识与状态，不含 ``proof``、``public_inputs``、调用栈或验证器内
+    部信息。验证器行为稳定时，对同值输入重复诊断结果一致。
+    """
+    _, raw_proofs = _validate_batch(batch)
+    proofs = _normalize_proofs(raw_proofs)
+    _ensure_unique_ids(proofs)
+
+    if not isinstance(group_id, str) or not group_id:
+        raise InvalidAggregationGroupSelectionError(
+            f"group_id must be a non-empty str, got {group_id!r}"
+        )
+
+    groups = _group_proofs(proofs)
+    selected: Optional[Tuple[GroupKey, List[Proof]]] = None
+    for key, members in groups:
+        if f"{key[0]}:{key[1]}:{key[2]}" == group_id:
+            selected = (key, members)
+            break
+    if selected is None:
+        # 先于验证器解析：选择的组不存在时，不调用任何验证器。
+        raise UnknownAggregationGroupError(group_id)
+
+    key, members = selected
+    proof_ids = [proof.proof_id for proof in members]
+
+    protocol_map = _resolve_verifiers(verifiers)
+    verifier = protocol_map.get(key[0])
+    if verifier is None:
+        raise UnsupportedProofSystemError(key[0])
+    # 诊断只调用 aggregate：仅在该调用点惰性检查契约。
+    _require_method(verifier, "aggregate")
+
+    # ---- 第一层：单证（按批次原序）--------------------------------------
+    single_conflicts: List[List[str]] = []
+    for proof in members:
+        if _aggregate_is_incompatible(verifier, [proof]):
+            single_conflicts.append([proof.proof_id])
+    if single_conflicts:
+        return _conflict_report(
+            group_id,
+            proof_ids,
+            CONFLICT_SINGLE,
+            CONFLICT_SCOPE_SINGLE,
+            single_conflicts,
+        )
+
+    # ---- 第二层：两两组合（i<j，按两个位置的源序）-----------------------
+    pair_conflicts: List[List[str]] = []
+    size = len(members)
+    for i in range(size):
+        for j in range(i + 1, size):
+            if _aggregate_is_incompatible(verifier, [members[i], members[j]]):
+                pair_conflicts.append(
+                    [members[i].proof_id, members[j].proof_id]
+                )
+    if pair_conflicts:
+        return _conflict_report(
+            group_id,
+            proof_ids,
+            CONFLICT_PAIR,
+            CONFLICT_SCOPE_PAIR,
+            pair_conflicts,
+        )
+
+    # ---- 第三层：整组 ---------------------------------------------------
+    if _aggregate_is_incompatible(verifier, members):
+        return _conflict_report(
+            group_id,
+            proof_ids,
+            CONFLICT_HIGHER_ORDER,
+            CONFLICT_SCOPE_HIGHER_ORDER,
+            [list(proof_ids)],
+        )
+
+    return _conflict_report(
+        group_id,
+        proof_ids,
+        CONFLICT_NO_CONFLICT,
+        CONFLICT_SCOPE_NONE,
+        [],
+    )
+
+
+def _aggregate_is_incompatible(
+    verifier: ZKVerifier, members: List[Proof]
+) -> bool:
+    """调用一次 ``aggregate``：IncompatibleAggregationError 记冲突。
+
+    其他异常（含验证器抛出的任意非聚合冲突异常）原样传播，不做归责；
+    返回值被忽略——诊断不判断有效性。
+    """
+    try:
+        verifier.aggregate(members)
+    except IncompatibleAggregationError:
+        return True
+    return False
+
+
+def _conflict_report(
+    group_id: str,
+    proof_ids: List[str],
+    status: str,
+    scope: str,
+    conflict_sets: List[List[str]],
+) -> AggregationConflictReport:
+    involved = {pid for conflict_set in conflict_sets for pid in conflict_set}
+    conflicted_proof_ids = [pid for pid in proof_ids if pid in involved]
+    return AggregationConflictReport(
+        group_id=group_id,
+        proof_ids=proof_ids,
+        status=status,
+        scope=scope,
+        conflict_sets=conflict_sets,
+        conflicted_proof_ids=conflicted_proof_ids,
+    )
 
 
 def _run_pipeline(batch: Any, verifiers: Any) -> _PipelineOutput:

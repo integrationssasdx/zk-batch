@@ -52,6 +52,34 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     时异常向调用方传播，其他聚合异常按该窗口 `aggregate` 失败定位到窗内
     每证，单证拒绝与异常沿用既有 `code`。既有入口与队列的
     result/report、`reverify_failures`、`reverify_groups` 与对账均不变。
+- `diagnose_aggregation_conflict(batch, verifiers, group_id)` —— 在不做
+  有效性判断的前提下定位单个聚合组内的聚合冲突，返回
+  `AggregationConflictReport`（固定键序 `to_dict`：`group_id`、
+  `proof_ids`、`status`、`scope`、`conflict_sets`、
+  `conflicted_proof_ids`）。
+  - `batch`、`verifiers` 沿用 `verify_batch`：空批次、字段错误、重复
+    `proof_id` 的校验类型与优先级完全不变；随后按
+    `(protocol, circuit_id, aggregation_key)` 分组定位 `group_id`
+    （`"protocol:circuit_id:aggregation_key"`）。`group_id` 不是非空
+    字符串抛 `InvalidAggregationGroupSelectionError`，合法但批次中不
+    存在抛 `UnknownAggregationGroupError`，两者都不调用 `aggregate`；
+    组的 protocol 无验证器抛 `UnsupportedProofSystemError`，验证器契约
+    违约抛 `VerifierContractError`。
+  - 定位只调用 `aggregate`，不调用 `verify_aggregate` 或 `verify`，不
+    判断返回值有效性。依次检查三层，每层无冲突才进入下一层：单证
+    （每证一次）、两两组合（按两个位置的源序 `i<j`）、整组；集合内
+    `proof_id` 保持批次原序。`aggregate` 抛
+    `IncompatibleAggregationError` 记为该层冲突，其他异常原样传播。
+  - 无冲突时 `status="no_conflict"`、`scope="none"`、两个集合为空；
+    单证/两证/整组冲突依次记 `status`/`scope` 为 `single`/`pair`/
+    `higher_order`，`conflict_sets` 保存该层命中的集合（单证为单元素
+    集合、两证为两元素集合，`higher_order` 只含整组 `proof_ids` 一个
+    集合）。`conflicted_proof_ids` 按 `proof_ids` 顺序合并去重。
+  - 诊断是只读操作：不改变 `batch`、不落盘、不起线程、不联网，报告不含
+    `proof`、`public_inputs`、调用栈或验证器内部信息；验证器行为稳定
+    时，同值输入重复诊断结果一致。既有公开验证入口、`VerificationQueue`、
+    `VerificationTaskQueue` 行为不变，旧入口的
+    `IncompatibleAggregationError` 仍照原规则传播。
 - `VerificationQueue` —— 内存中的串行作业队列，不起线程、不联网、不落盘。
   作业执行时一次走完整的详细验证流水线并保存报告：
   - `result(job_id)` 返回该次执行的 `BatchVerificationResult`；

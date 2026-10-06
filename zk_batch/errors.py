@@ -62,6 +62,26 @@ class VerifierContractError(ZKBatchError):
     """验证器缺方法，或其返回值不是布尔。"""
 
 
+class InvalidAggregationGroupSelectionError(ZKBatchError):
+    """``diagnose_aggregation_conflict`` 的 ``group_id`` 非法。
+
+    合法的 ``group_id`` 是非空字符串；非法时不解析、不调用任何验证器，
+    也不调用 ``aggregate``。
+    """
+
+
+class UnknownAggregationGroupError(ZKBatchError):
+    """``group_id`` 合法但批次中不存在该聚合组。
+
+    批次分组按 (protocol, circuit_id, aggregation_key) 生成；选中的
+    标识不在其中时抛出，且不调用 ``aggregate``。
+    """
+
+    def __init__(self, group_id: str):
+        super().__init__(f"unknown aggregation group: {group_id!r}")
+        self.group_id = group_id
+
+
 # ---------------------------------------------------------------- 队列阶段
 
 class QueueError(ZKBatchError):

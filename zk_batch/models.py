@@ -263,6 +263,52 @@ class WindowedBatchVerificationReport:
         }
 
 
+# ====================================== 聚合冲突定位（diagnose_aggregation_conflict）
+
+# 冲突结论
+CONFLICT_NO_CONFLICT = "no_conflict"
+CONFLICT_SINGLE = "single"
+CONFLICT_PAIR = "pair"
+CONFLICT_HIGHER_ORDER = "higher_order"
+
+# 定位层级（scope）
+CONFLICT_SCOPE_NONE = "none"
+CONFLICT_SCOPE_SINGLE = "single"
+CONFLICT_SCOPE_PAIR = "pair"
+CONFLICT_SCOPE_HIGHER_ORDER = "higher_order"
+
+
+@dataclass(frozen=True)
+class AggregationConflictReport:
+    """单个聚合组的冲突定位报告。
+
+    ``proof_ids`` 为该组证明按批次原序的标识；``status`` 取
+    ``no_conflict``/``single``/``pair``/``higher_order``，``scope``
+    与命中的层级一致（无冲突时为 ``none``）。``conflict_sets`` 保存
+    命中层级上按规则排列的冲突集合（单证为单元素集合、两两组合为两
+    元素集合，整组冲突时只含整组 ``proof_ids`` 一个集合）；
+    ``conflicted_proof_ids`` 按 ``proof_ids`` 顺序合并去重。不含
+    ``proof`` 与 ``public_inputs``。
+    """
+
+    group_id: str
+    proof_ids: List[str]
+    status: str
+    scope: str
+    conflict_sets: List[List[str]]
+    conflicted_proof_ids: List[str]
+
+    def to_dict(self) -> dict:
+        return {
+            "group_id": self.group_id,
+            "proof_ids": list(self.proof_ids),
+            "status": self.status,
+            "scope": self.scope,
+            "conflict_sets": [list(ids) for ids in self.conflict_sets],
+            "conflicted_proof_ids": list(self.conflicted_proof_ids),
+        }
+
+
 @dataclass
 class VerificationJob:
     """队列中的一个验证作业。"""

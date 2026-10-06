@@ -19,6 +19,7 @@ from .errors import (
     EmptyBatchError,
     GroupReverifyLineageMismatchError,
     IncompatibleAggregationError,
+    InvalidAggregationGroupSelectionError,
     InvalidAggregationLimitError,
     InvalidGroupSelectionError,
     InvalidItemIdError,
@@ -33,6 +34,7 @@ from .errors import (
     TaskLineageMismatchError,
     TaskNotFoundError,
     TaskStateConflictError,
+    UnknownAggregationGroupError,
     UnknownFailedGroupError,
     UnknownJobError,
     UnsupportedProofSystemError,
@@ -40,6 +42,7 @@ from .errors import (
     VerifierContractError,
 )
 from .models import (
+    AggregationConflictReport,
     BatchSummary,
     BatchVerificationReport,
     BatchVerificationResult,
@@ -73,12 +76,18 @@ from .models import (
 from .queue import VerificationQueue
 from .tasks import VerificationTaskQueue
 from .verifier import ZKVerifier
-from .engine import verify_batch, verify_batch_detailed, verify_batch_windowed
+from .engine import (
+    diagnose_aggregation_conflict,
+    verify_batch,
+    verify_batch_detailed,
+    verify_batch_windowed,
+)
 
 __all__ = [
     "verify_batch",
     "verify_batch_detailed",
     "verify_batch_windowed",
+    "diagnose_aggregation_conflict",
     "VerificationQueue",
     "VerificationTaskQueue",
     "ZKVerifier",
@@ -90,6 +99,7 @@ __all__ = [
     "ProofVerificationDetail",
     "WindowVerificationReport",
     "WindowedBatchVerificationReport",
+    "AggregationConflictReport",
     "VerificationJob",
     "ItemResult",
     "BatchTaskResult",
@@ -118,6 +128,8 @@ __all__ = [
     "UnsupportedProofSystemError",
     "VerifierContractError",
     "InvalidAggregationLimitError",
+    "InvalidAggregationGroupSelectionError",
+    "UnknownAggregationGroupError",
     "RunningJobError",
     "CompletedJobError",
     "CancelledJobError",
