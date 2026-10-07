@@ -39,6 +39,14 @@
   组无失败 recovered，否则 still_failed）。不调用验证器、不创建作业、不
   改变任何状态或结果，重复查询一致；谱系必须是直接的 ``reverify_groups``
   父子关系，与逐证复核谱系互不替代。
+* :meth:`retry_by_error_code` 按失败定位结果筛选证明并定向重试：以
+  ``batch_id``、匹配的失败错误码与可选 ``proof_ids`` 为输入，先确认批次
+  与证明归属，再把符合条件的证明重新加入本队列（独立的 queued 作业），
+  响应中逐个返回 proofId 被接受或被跳过（跳过原因为五种固定字面量之
+  一）；之后仍由既有 ``result``/``report`` 给出新验证状态和失败定位。
+  同一证明重复请求行为确定：已接受并处于待验证或验证中的记
+  ``ALREADY_QUEUED``，已有最新成功结果的记 ``ALREADY_COMPLETED``，已有
+  失败定位但不匹配本次错误码的记 ``NOT_RETRYABLE``。
 
 不持久化、不联网、不使用线程。
 """
@@ -47,14 +55,18 @@ from __future__ import annotations
 
 import itertools
 from collections import OrderedDict
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple
 
 from .engine import verify_batch_detailed
 from .errors import (
+    BatchNotFoundException,
     CancelledJobError,
     CompletedJobError,
     InvalidGroupSelectionError,
+    InvalidRetrySelectionException,
     NoFailedProofError,
+    ProofNotInBatchException,
     ResultUnavailableError,
     GroupReverifyLineageMismatchError,
     ReverifyLineageMismatchError,
@@ -63,8 +75,14 @@ from .errors import (
     UnknownJobError,
 )
 from .models import (
+    CODE_REJECTED,
+    CODE_VERIFY_ERROR,
     OUTCOME_RECOVERED,
     OUTCOME_STILL_FAILED,
+    RETRY_SKIP_ALREADY_COMPLETED,
+    RETRY_SKIP_ALREADY_QUEUED,
+    RETRY_SKIP_NOT_RETRYABLE,
+    RETRY_SKIP_UNKNOWN_PROOF,
     REVERIFY_AFTER_FAILED,
     REVERIFY_AFTER_PASSED,
     REVERIFY_BEFORE_STATUS,
@@ -74,6 +92,8 @@ from .models import (
     GroupReverifyOutcomeReport,
     GroupReverifyProofItem,
     GroupReverifySubmission,
+    ProofRetrySkip,
+    ProofRetrySubmission,
     ReverifyOutcomeItem,
     ReverifyOutcomeReport,
     VerificationJob,
@@ -83,6 +103,23 @@ STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_CANCELLED = "cancelled"
+
+# 定向重试可匹配的失败错误码（即失败定位使用的全部 code）
+_RETRY_ERROR_CODES = (CODE_REJECTED, CODE_VERIFY_ERROR)
+
+
+class _BatchRecord:
+    """批次台账（内部）：批次存在性、证明归属与最新逐证结果。
+
+    ``proofs`` 登记首次出现的原始证明材料（保持批次原序，同一
+    ``batch_id`` 的多次提交取并集）；``latest`` 记录每个证明最近一次
+    completed 作业的结果——键缺失表示尚无结果，值为 ``None`` 表示
+    通过，值为字符串表示失败定位的错误码。
+    """
+
+    def __init__(self) -> None:
+        self.proofs: "OrderedDict[str, Any]" = OrderedDict()
+        self.latest: Dict[str, Optional[str]] = {}
 
 
 class VerificationQueue:
@@ -101,6 +138,8 @@ class VerificationQueue:
         # 按组复核的父子关系：复核作业 id -> (源作业 id, 请求的分组顺序)；
         # 与逐证复核谱系分开记录、互不替代。
         self._group_reverify_lineage: Dict[str, Tuple[str, Tuple[str, ...]]] = {}
+        # 批次台账：batch_id -> _BatchRecord（定向重试的批次/归属/最新结果）
+        self._batches: "OrderedDict[Any, _BatchRecord]" = OrderedDict()
         self._counter = itertools.count(1)
 
     # ------------------------------------------------------------ 入队/执行
@@ -110,6 +149,7 @@ class VerificationQueue:
 
         ``verifiers`` 省略时使用构造队列时给定的默认验证器。
         """
+        self._register_batch(batch)
         job_id = f"job-{next(self._counter)}"
         self._jobs[job_id] = VerificationJob(
             job_id=job_id,
@@ -150,6 +190,7 @@ class VerificationQueue:
         job.status = STATUS_COMPLETED
         job.result = report.result
         self._reports[job.job_id] = report
+        self._record_completion(job)
         return report.result
 
     def cancel(self, job_id: str) -> bool:
@@ -416,6 +457,120 @@ class VerificationQueue:
             retry.status,
         )
 
+    # ---------------------------------------------------- 按错误码定向重试
+
+    def retry_by_error_code(
+        self,
+        batch_id: Any,
+        error_code: Any,
+        proof_ids: Any = None,
+        verifiers: Any = None,
+    ) -> ProofRetrySubmission:
+        """按失败定位结果筛选证明并定向重试，返回
+        :class:`ProofRetrySubmission`。
+
+        以 ``batch_id``、匹配的失败错误码 ``error_code`` 与可选的
+        ``proof_ids`` 为输入，先确认批次与证明归属，再把符合条件的证明
+        重新加入本队列。不提供 ``proof_ids`` 时选择批次内所有匹配错误码
+        且可重试的证明（按批次原序）；提供时只在请求的证明中筛选，
+        ``accepted`` 与 ``skipped`` 均按输入 ``proof_ids`` 顺序返回，
+        重复项直接报错而不静默去重。被接受的证明按接受顺序组成子批次
+        （``batch_id`` 与证明材料原样保留）创建独立的 queued 作业，之后
+        仍由既有 :meth:`result`/:meth:`report` 给出新验证状态和失败定位。
+
+        响应逐个给出 proofId 被接受或被跳过，跳过原因只取
+        ``UNKNOWN_PROOF``（标识在系统中未知）、``PROOF_NOT_IN_BATCH``
+        （证明不属于该批次）、``NOT_RETRYABLE``（已有失败定位但不匹配
+        本次错误码，或尚无失败定位）、``ALREADY_QUEUED``（已接受并处于
+        待验证或验证中）、``ALREADY_COMPLETED``（已有最新成功结果）之
+        一。同一证明重复请求行为确定：已接受并处于待验证或验证中的记
+        ``ALREADY_QUEUED``，已有最新成功结果的记 ``ALREADY_COMPLETED``，
+        已有失败定位但禁止重试的记 ``NOT_RETRYABLE``。筛选后没有可接受
+        证明时请求不报错：``accepted`` 为空、``job_id`` 为 ``None``，
+        ``skipped`` 逐条给出原因。
+
+        本方法不改变已有聚合规则、队列顺序、成功与失败结果及单证语义；
+        筛选只决定证明是否重新验证，不改写历史失败结果、错误码含义、
+        批次归属或既有请求响应格式。``verifiers`` 只作用于新作业，省略
+        时使用队列默认验证器。
+
+        异常按以下顺序依次检查、互不替代；检出时不创建作业、不改变任何
+        既有状态：
+
+        * 批次不存在 ——BatchNotFoundException；
+        * 空 ``proof_ids``、重复或非法的证明标识、无法识别的失败错误码
+          ——InvalidRetrySelectionException；
+        * 请求的证明已知归属其他批次 ——ProofNotInBatchException；
+          完全未知的标识不是请求级错误，在响应中逐条记
+          ``UNKNOWN_PROOF`` 跳过。
+        """
+        record = self._require_batch_record(batch_id)
+        code = _validate_retry_error_code(error_code)
+        requested = _validate_retry_proof_ids(proof_ids)
+
+        if requested is not None:
+            # 证明归属确认：已知归属其他批次的证明是请求级错误；完全未知
+            # 的标识留给筛选阶段逐条记 UNKNOWN_PROOF 跳过。
+            for proof_id in requested:
+                if proof_id not in record.proofs and self._known_in_other_batch(
+                    batch_id, proof_id
+                ):
+                    raise ProofNotInBatchException(batch_id, proof_id)
+
+        queued_ids = self._queued_proof_ids(batch_id)
+        accepted: List[str] = []
+        skipped: List[ProofRetrySkip] = []
+
+        if requested is None:
+            # 全批次选择：批次内所有匹配错误码且可重试的证明，按批次原序；
+            # 未显式请求的证明不进入 skipped。
+            for proof_id in record.proofs:
+                if (
+                    proof_id not in queued_ids
+                    and proof_id in record.latest
+                    and record.latest[proof_id] == code
+                ):
+                    accepted.append(proof_id)
+        else:
+            for proof_id in requested:
+                if proof_id not in record.proofs:
+                    skipped.append(
+                        ProofRetrySkip(proof_id, RETRY_SKIP_UNKNOWN_PROOF)
+                    )
+                elif proof_id in queued_ids:
+                    skipped.append(
+                        ProofRetrySkip(proof_id, RETRY_SKIP_ALREADY_QUEUED)
+                    )
+                elif proof_id not in record.latest:
+                    skipped.append(
+                        ProofRetrySkip(proof_id, RETRY_SKIP_NOT_RETRYABLE)
+                    )
+                elif record.latest[proof_id] is None:
+                    skipped.append(
+                        ProofRetrySkip(proof_id, RETRY_SKIP_ALREADY_COMPLETED)
+                    )
+                elif record.latest[proof_id] != code:
+                    skipped.append(
+                        ProofRetrySkip(proof_id, RETRY_SKIP_NOT_RETRYABLE)
+                    )
+                else:
+                    accepted.append(proof_id)
+
+        job_id = None
+        if accepted:
+            sub_batch = {
+                "batch_id": batch_id,
+                "proofs": [record.proofs[proof_id] for proof_id in accepted],
+            }
+            job_id = self.enqueue(sub_batch, verifiers)
+        return ProofRetrySubmission(
+            batch_id=batch_id,
+            error_code=code,
+            job_id=job_id,
+            accepted=accepted,
+            skipped=skipped,
+        )
+
     # ---------------------------------------------------------------- 内部
 
     def _next_queued(self) -> Optional[VerificationJob]:
@@ -434,6 +589,109 @@ class VerificationQueue:
     def _job_verifiers(self, job_id: str, verifiers: Any) -> None:
         chosen = verifiers if verifiers is not None else self._default_verifiers
         self._verifiers[job_id] = chosen
+
+    # ------------------------------------------------------------ 批次台账
+
+    def _require_batch_record(self, batch_id: Any) -> _BatchRecord:
+        """定向重试的批次确认：批次不存在抛 BatchNotFoundException。"""
+        try:
+            record = self._batches.get(batch_id)
+        except TypeError:
+            # 不可哈希的 batch_id 不可能登记过，按批次不存在处理。
+            record = None
+        if record is None:
+            raise BatchNotFoundException(batch_id)
+        return record
+
+    def _register_batch(self, batch: Any) -> None:
+        """把入队批次登记到台账：批次存在性、证明归属与批次原序。
+
+        同一 ``batch_id`` 的多次提交（原始批次与各类复核子批次）取并集：
+        首次出现的证明材料与原序保持不变。入队不做批次校验（校验在执行
+        时进行），无法辨认的批次内容不登记。
+        """
+        if not isinstance(batch, Mapping) or "batch_id" not in batch:
+            return
+        batch_id = batch["batch_id"]
+        try:
+            record = self._batches.get(batch_id)
+        except TypeError:
+            # 不可哈希的 batch_id 不入台账。
+            return
+        if record is None:
+            record = _BatchRecord()
+            self._batches[batch_id] = record
+        proofs = batch.get("proofs")
+        if not isinstance(proofs, (list, tuple)):
+            return
+        for raw in proofs:
+            if not isinstance(raw, Mapping):
+                continue
+            proof_id = raw.get("proof_id")
+            if (
+                isinstance(proof_id, str)
+                and proof_id
+                and proof_id not in record.proofs
+            ):
+                record.proofs[proof_id] = raw
+
+    def _record_completion(self, job: VerificationJob) -> None:
+        """把 completed 作业的逐证结果写入批次台账（最新结果覆盖旧值）。
+
+        只读本次执行的 ``job.result``，不调用验证器、不改变作业状态；
+        历史失败结果与错误码含义保持不变。
+        """
+        batch = job.batch
+        if not isinstance(batch, Mapping) or "batch_id" not in batch:
+            return
+        try:
+            record = self._batches.get(batch["batch_id"])
+        except TypeError:
+            return
+        if record is None or job.result is None:
+            return
+        failure_codes: Dict[str, str] = {}
+        for failure in job.result.failures:
+            failure_codes.setdefault(failure.proof_id, failure.code)
+        proofs = batch.get("proofs")
+        if not isinstance(proofs, (list, tuple)):
+            return
+        for raw in proofs:
+            if not isinstance(raw, Mapping):
+                continue
+            proof_id = raw.get("proof_id")
+            if not isinstance(proof_id, str) or not proof_id:
+                continue
+            # None 表示最新结果为通过；字符串为最新失败定位的错误码。
+            record.latest[proof_id] = failure_codes.get(proof_id)
+
+    def _queued_proof_ids(self, batch_id: Any) -> set:
+        """该批次当前处于待验证（queued）或验证中（running）的证明标识。"""
+        queued = set()
+        for job in self._jobs.values():
+            if job.status not in (STATUS_QUEUED, STATUS_RUNNING):
+                continue
+            batch = job.batch
+            if not isinstance(batch, Mapping):
+                continue
+            if batch.get("batch_id") != batch_id:
+                continue
+            proofs = batch.get("proofs")
+            if not isinstance(proofs, (list, tuple)):
+                continue
+            for raw in proofs:
+                if isinstance(raw, Mapping):
+                    proof_id = raw.get("proof_id")
+                    if isinstance(proof_id, str) and proof_id:
+                        queued.add(proof_id)
+        return queued
+
+    def _known_in_other_batch(self, batch_id: Any, proof_id: str) -> bool:
+        """证明标识是否已登记在其他批次（归属确认）。"""
+        for other_id, record in self._batches.items():
+            if other_id != batch_id and proof_id in record.proofs:
+                return True
+        return False
 
 
 # ============================================================ 复核对账
@@ -529,6 +787,46 @@ def _validate_group_selection(group_ids: Any) -> None:
         if gid in seen:
             raise InvalidGroupSelectionError(f"duplicate group id: {gid!r}")
         seen.add(gid)
+
+
+# ========================================================== 定向重试辅助
+
+def _validate_retry_error_code(error_code: Any) -> str:
+    """校验失败错误码：只接受失败定位使用的公开 code。"""
+    if not isinstance(error_code, str) or error_code not in _RETRY_ERROR_CODES:
+        raise InvalidRetrySelectionException(
+            f"unrecognized failure error code: {error_code!r}"
+        )
+    return error_code
+
+
+def _validate_retry_proof_ids(proof_ids: Any) -> Optional[List[str]]:
+    """校验定向重试的证明选择；``None`` 表示不筛选（全批次匹配）。
+
+    提供时必须是非空列表/元组，元素为非空字符串且不重复——空
+    ``proof_ids``、重复或非法元素都抛 InvalidRetrySelectionException，
+    重复项直接报错而不静默去重。
+    """
+    if proof_ids is None:
+        return None
+    if not isinstance(proof_ids, (list, tuple)) or len(proof_ids) == 0:
+        raise InvalidRetrySelectionException(
+            "proof_ids must be a non-empty list or tuple of non-empty str"
+        )
+    seen = set()
+    requested: List[str] = []
+    for proof_id in proof_ids:
+        if not isinstance(proof_id, str) or not proof_id:
+            raise InvalidRetrySelectionException(
+                f"proof id must be a non-empty str, got {proof_id!r}"
+            )
+        if proof_id in seen:
+            raise InvalidRetrySelectionException(
+                f"duplicate proof id: {proof_id!r}"
+            )
+        seen.add(proof_id)
+        requested.append(proof_id)
+    return requested
 
 
 def _build_group_reverify_outcome(

@@ -134,6 +134,39 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     `ResultUnavailableError`，非直接 `reverify_groups` 谱系抛
     `GroupReverifyLineageMismatchError`，三者及与
     `ReverifyLineageMismatchError` 均互不替代。
+  - `retry_by_error_code(batch_id, error_code, proof_ids=None, verifiers=None)`
+    —— 按失败定位结果筛选证明并定向重试，返回 `ProofRetrySubmission`
+    （固定键序 `to_dict`：`batch_id`、`error_code`、`job_id`、`accepted`、
+    `skipped`）。沿用既有批量提交、验证与结果查询入口，不改变已有聚合
+    规则、队列顺序、成功与失败结果及单个证明语义：
+    - 批次随 `enqueue` 登记台账（存在性、证明归属、批次原序），作业
+      completed 时把逐证最新结果（通过或失败错误码）写入台账；筛选只
+      决定证明是否重新验证，不改写历史失败结果、错误码含义、批次归属
+      或既有请求响应格式。
+    - `error_code` 只接受失败定位使用的公开错误码（`rejected` /
+      `verify_error`）。不提供 `proof_ids` 时选择批次内所有匹配错误码
+      且可重试的证明（按批次原序）；提供时只在请求的证明中筛选，
+      `accepted`/`skipped` 均按输入 `proof_ids` 顺序返回，重复项直接
+      报错而不静默去重。
+    - 被接受的证明按接受顺序组成子批次（`batch_id` 与证明材料原样
+      保留）重新加入现有验证队列，返回新 `job_id`；之后仍由既有
+      `result`/`report` 给出新验证状态和失败定位。筛选后没有可接受
+      证明时请求不报错、不建作业：`accepted` 为空、`job_id` 为
+      `None`，`skipped` 逐条给出原因。
+    - 跳过原因（`ProofRetrySkip.reason`，固定键序 `to_dict`：
+      `proof_id`、`reason`）只取五种固定字面量之一：
+      `UNKNOWN_PROOF`（标识在系统中未知）、`PROOF_NOT_IN_BATCH`
+      （证明不属于该批次）、`NOT_RETRYABLE`（已有失败定位但不匹配本次
+      错误码，或尚无失败定位）、`ALREADY_QUEUED`（已接受并处于待验证
+      或验证中）、`ALREADY_COMPLETED`（已有最新成功结果）。同一证明
+      重复请求行为确定，相同输入重复执行得到相同结果。
+    - 异常按序检查、互不替代，检出时不创建作业、不改变任何既有状态：
+      批次不存在 `BatchNotFoundException`；空 `proof_ids`、重复或非法
+      证明标识、无法识别的失败错误码 `InvalidRetrySelectionException`；
+      请求的证明已知归属其他批次 `ProofNotInBatchException`（完全未知
+      的标识不是请求级错误，逐条记 `UNKNOWN_PROOF` 跳过）。三类异常
+      同时以 `BatchNotFoundError`/`InvalidRetrySelectionError`/
+      `ProofNotInBatchError` 别名导出（与对应 `*Exception` 同一类型）。
 - `VerificationTaskQueue` —— 可排队、可定位失败原因的**逐项**批量验证队列，
   与上面的分组聚合队列相互独立；同样不起线程、不联网、不落盘。输入是一组
   按业务顺序排列的验证项，每项含稳定标识 `item_id`（非空字符串）与证明

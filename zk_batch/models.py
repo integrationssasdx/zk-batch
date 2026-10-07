@@ -845,3 +845,67 @@ class GroupReverifyOutcomeReport:
             "recovered_count": self.recovered_count,
             "still_failed_count": self.still_failed_count,
         }
+
+
+# ========================================== 定向重试（retry_by_error_code）
+
+# 跳过原因（固定字面量）：响应中逐条给出，只取以下五种之一。
+RETRY_SKIP_UNKNOWN_PROOF = "UNKNOWN_PROOF"      # 证明标识在系统中未知
+RETRY_SKIP_PROOF_NOT_IN_BATCH = "PROOF_NOT_IN_BATCH"  # 证明不属于该批次
+RETRY_SKIP_NOT_RETRYABLE = "NOT_RETRYABLE"      # 已有失败定位但禁止重试
+RETRY_SKIP_ALREADY_QUEUED = "ALREADY_QUEUED"    # 已接受并处于待验证或验证中
+RETRY_SKIP_ALREADY_COMPLETED = "ALREADY_COMPLETED"  # 已有最新成功结果
+
+RETRY_SKIP_REASONS = (
+    RETRY_SKIP_UNKNOWN_PROOF,
+    RETRY_SKIP_PROOF_NOT_IN_BATCH,
+    RETRY_SKIP_NOT_RETRYABLE,
+    RETRY_SKIP_ALREADY_QUEUED,
+    RETRY_SKIP_ALREADY_COMPLETED,
+)
+
+
+@dataclass(frozen=True)
+class ProofRetrySkip:
+    """定向重试响应中单个被跳过证明的记录。
+
+    ``reason`` 只取 ``RETRY_SKIP_REASONS`` 之一。只承载定位信息，不含
+    证明材料、``public_inputs``、调用栈或验证器信息。
+    """
+
+    proof_id: str
+    reason: str
+
+    def to_dict(self) -> dict:
+        return {
+            "proof_id": self.proof_id,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class ProofRetrySubmission:
+    """按失败错误码定向重试的提交回执。
+
+    ``batch_id`` 原样回填；``error_code`` 为本次匹配的错误码；
+    ``job_id`` 为被接受证明重新入队的新作业标识（没有被接受证明时为
+    ``None``，不创建作业）；``accepted`` 为被接受的证明标识（提供
+    ``proof_ids`` 时按输入顺序，否则按批次原序）；``skipped`` 为逐条
+    跳过记录，顺序与 ``accepted`` 的取值口径一致。只承载定位信息，
+    不含证明材料、``public_inputs``、调用栈或验证器信息。
+    """
+
+    batch_id: Any
+    error_code: str
+    job_id: Any  # Optional[str]：accepted 为空时为 None
+    accepted: List[str]
+    skipped: List[ProofRetrySkip]
+
+    def to_dict(self) -> dict:
+        return {
+            "batch_id": self.batch_id,
+            "error_code": self.error_code,
+            "job_id": self.job_id,
+            "accepted": list(self.accepted),
+            "skipped": [skip.to_dict() for skip in self.skipped],
+        }

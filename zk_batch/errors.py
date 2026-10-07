@@ -147,6 +147,49 @@ class GroupReverifyLineageMismatchError(QueueError):
     """
 
 
+class BatchNotFoundException(QueueError):
+    """定向重试指定的批次在队列台账中不存在。
+
+    批次随 :meth:`VerificationQueue.enqueue` 登记；从未提交过的批次标识
+    抛出本异常。与 :class:`InvalidRetrySelectionException`（选择非法）和
+    :class:`ProofNotInBatchException`（证明归属其他批次）互不替代。
+    """
+
+    def __init__(self, batch_id: object):
+        super().__init__(f"unknown aggregate batch: {batch_id!r}")
+        self.batch_id = batch_id
+
+
+class ProofNotInBatchException(QueueError):
+    """请求的证明已知归属其他批次，不属于本次指定的批次。
+
+    定向重试先确认批次与证明归属：请求的证明标识已登记在其他批次时
+    抛出本异常（请求级错误，不进入筛选、不创建作业）；完全未知的标识
+    不是请求级错误，在响应中逐条记 ``UNKNOWN_PROOF`` 跳过。
+    """
+
+    def __init__(self, batch_id: object, proof_id: str):
+        super().__init__(
+            f"proof {proof_id!r} does not belong to batch {batch_id!r}"
+        )
+        self.batch_id = batch_id
+        self.proof_id = proof_id
+
+
+class InvalidRetrySelectionException(QueueError):
+    """定向重试的选择非法。
+
+    空 ``proof_ids``、重复或非法的证明标识、无法识别的失败错误码均抛
+    本异常；检出时不创建作业、不改变任何既有状态。
+    """
+
+
+# 与仓库既有 *Error 命名习惯一致的别名（与对应 *Exception 为同一类型）。
+BatchNotFoundError = BatchNotFoundException
+ProofNotInBatchError = ProofNotInBatchException
+InvalidRetrySelectionError = InvalidRetrySelectionException
+
+
 # ------------------------------------------------- 排队批量验证（任务流）
 
 class TaskValidationError(ZKBatchError):
