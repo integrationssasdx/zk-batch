@@ -11,6 +11,8 @@
 """
 
 from .errors import (
+    BatchNotFoundError,
+    BatchNotFoundException,
     BatchSizeLimitError,
     CancelledJobError,
     CompletedJobError,
@@ -26,8 +28,12 @@ from .errors import (
     InvalidPriorityError,
     InvalidProofError,
     InvalidProofFormatError,
+    InvalidRetrySelectionError,
+    InvalidRetrySelectionException,
     NoFailedProofError,
     NoRetryableItemsError,
+    ProofNotInBatchError,
+    ProofNotInBatchException,
     ResultUnavailableError,
     ReverifyLineageMismatchError,
     RunningJobError,
@@ -42,6 +48,11 @@ from .errors import (
     VerifierContractError,
 )
 from .models import (
+    RETRY_SKIP_ALREADY_COMPLETED,
+    RETRY_SKIP_ALREADY_QUEUED,
+    RETRY_SKIP_NOT_RETRYABLE,
+    RETRY_SKIP_PROOF_NOT_IN_BATCH,
+    RETRY_SKIP_UNKNOWN_PROOF,
     AggregationConflictReport,
     BatchSummary,
     BatchVerificationReport,
@@ -58,6 +69,8 @@ from .models import (
     MAX_TASK_PRIORITY,
     MIN_TASK_PRIORITY,
     Proof,
+    ProofRetryResponse,
+    ProofRetrySkipItem,
     ProofVerificationDetail,
     RetryOutcomeItem,
     RetryOutcomeReport,
@@ -82,6 +95,19 @@ from .engine import (
     verify_batch_detailed,
     verify_batch_windowed,
 )
+
+# 定向重试跳过原因的裸名常量（与 RETRY_SKIP_* 同值，便于不同命名风格）。
+UNKNOWN_PROOF = RETRY_SKIP_UNKNOWN_PROOF
+PROOF_NOT_IN_BATCH = RETRY_SKIP_PROOF_NOT_IN_BATCH
+NOT_RETRYABLE = RETRY_SKIP_NOT_RETRYABLE
+ALREADY_QUEUED = RETRY_SKIP_ALREADY_QUEUED
+ALREADY_COMPLETED = RETRY_SKIP_ALREADY_COMPLETED
+
+# 定向重试响应模型的同义别名。
+ProofRetrySubmission = ProofRetryResponse
+RetryProofsResponse = ProofRetryResponse
+ProofRetrySelection = ProofRetryResponse
+SkippedProof = ProofRetrySkipItem
 
 __all__ = [
     "verify_batch",
@@ -118,6 +144,22 @@ __all__ = [
     "GroupReverifyGroupItem",
     "GroupReverifyProofItem",
     "GroupReverifyOutcomeReport",
+    "ProofRetryResponse",
+    "ProofRetrySkipItem",
+    "ProofRetrySubmission",
+    "RetryProofsResponse",
+    "ProofRetrySelection",
+    "SkippedProof",
+    "RETRY_SKIP_UNKNOWN_PROOF",
+    "RETRY_SKIP_PROOF_NOT_IN_BATCH",
+    "RETRY_SKIP_NOT_RETRYABLE",
+    "RETRY_SKIP_ALREADY_QUEUED",
+    "RETRY_SKIP_ALREADY_COMPLETED",
+    "UNKNOWN_PROOF",
+    "PROOF_NOT_IN_BATCH",
+    "NOT_RETRYABLE",
+    "ALREADY_QUEUED",
+    "ALREADY_COMPLETED",
     "MAX_BATCH_ITEMS",
     "MIN_TASK_PRIORITY",
     "MAX_TASK_PRIORITY",
@@ -136,6 +178,12 @@ __all__ = [
     "UnknownJobError",
     "ResultUnavailableError",
     "NoFailedProofError",
+    "BatchNotFoundError",
+    "BatchNotFoundException",
+    "InvalidRetrySelectionError",
+    "InvalidRetrySelectionException",
+    "ProofNotInBatchError",
+    "ProofNotInBatchException",
     "ReverifyLineageMismatchError",
     "InvalidGroupSelectionError",
     "UnknownFailedGroupError",

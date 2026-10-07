@@ -39,6 +39,14 @@
   组无失败 recovered，否则 still_failed）。不调用验证器、不创建作业、不
   改变任何状态或结果，重复查询一致；谱系必须是直接的 ``reverify_groups``
   父子关系，与逐证复核谱系互不替代。
+* :meth:`retry_failed_proofs` 按失败定位结果筛选证明并定向重试：以原批次
+  标识、匹配的失败错误码与可选 proofIds 为输入，先确认批次和证明归属，
+  再把当前仍失败且错误码匹配、可重试的证明重新加入本队列（独立的
+  queued 子任务）；响应逐个给出 proofId 被接受或被跳过（唯一跳过原因）。
+  重复请求行为确定：已接受且待验证/验证中的记 ``already_queued``，已有
+  最新成功结果的记 ``already_completed``，有失败定位但不可重试的记
+  ``not_retryable``。新作业的验证状态与失败定位仍由既有
+  :meth:`result`/:meth:`report` 查询给出。
 
 不持久化、不联网、不使用线程。
 """
@@ -47,14 +55,18 @@ from __future__ import annotations
 
 import itertools
 from collections import OrderedDict
+from collections.abc import Mapping
 from typing import Any, Dict, List, Optional, Tuple
 
 from .engine import verify_batch_detailed
 from .errors import (
+    BatchNotFoundError,
     CancelledJobError,
     CompletedJobError,
     InvalidGroupSelectionError,
+    InvalidRetrySelectionError,
     NoFailedProofError,
+    ProofNotInBatchError,
     ResultUnavailableError,
     GroupReverifyLineageMismatchError,
     ReverifyLineageMismatchError,
@@ -63,8 +75,13 @@ from .errors import (
     UnknownJobError,
 )
 from .models import (
+    CODE_REJECTED,
+    CODE_VERIFY_ERROR,
     OUTCOME_RECOVERED,
     OUTCOME_STILL_FAILED,
+    RETRY_SKIP_ALREADY_COMPLETED,
+    RETRY_SKIP_ALREADY_QUEUED,
+    RETRY_SKIP_NOT_RETRYABLE,
     REVERIFY_AFTER_FAILED,
     REVERIFY_AFTER_PASSED,
     REVERIFY_BEFORE_STATUS,
@@ -74,6 +91,8 @@ from .models import (
     GroupReverifyOutcomeReport,
     GroupReverifyProofItem,
     GroupReverifySubmission,
+    ProofRetryResponse,
+    ProofRetrySkipItem,
     ReverifyOutcomeItem,
     ReverifyOutcomeReport,
     VerificationJob,
@@ -83,6 +102,14 @@ STATUS_QUEUED = "queued"
 STATUS_RUNNING = "running"
 STATUS_COMPLETED = "completed"
 STATUS_CANCELLED = "cancelled"
+
+# 定向重试可识别的失败错误码（沿用 Failure.code 口径）
+RETRYABLE_FAILURE_CODES = (CODE_REJECTED, CODE_VERIFY_ERROR)
+
+# 定向重试中逐证明的内部状态
+_PROOF_PASSED = "passed"  # 最新一次验证通过
+_PROOF_FAILED = "failed"  # 最新一次验证失败（可按错误码筛选重试）
+_PROOF_QUEUED = "queued"  # 已被重试请求接受，子任务待验证或验证中
 
 
 class VerificationQueue:
@@ -94,6 +121,8 @@ class VerificationQueue:
         self._jobs: "OrderedDict[str, VerificationJob]" = OrderedDict()
         # 每个作业的验证器覆盖；VerificationJob 不新增字段以免污染公开模型
         self._verifiers: Dict[str, Any] = {}
+        # 作业进入验证时的配置快照（验证器选择），定向重试子任务沿用
+        self._config_snapshots: Dict[str, Any] = {}
         # completed 作业的详细报告；与 job.result 来自同一次流水线执行
         self._reports: Dict[str, BatchVerificationReport] = {}
         # 复核父子关系：复核作业 id -> 源作业 id；重复复核各自记录、互不覆盖
@@ -101,6 +130,14 @@ class VerificationQueue:
         # 按组复核的父子关系：复核作业 id -> (源作业 id, 请求的分组顺序)；
         # 与逐证复核谱系分开记录、互不替代。
         self._group_reverify_lineage: Dict[str, Tuple[str, Tuple[str, ...]]] = {}
+        # 定向重试：原批次（根）作业 id -> {proof_id: {"status", "code"}}，
+        # 首次处理该批次的重试请求时按源作业结果惰性建立。
+        self._proof_retry_states: Dict[str, Dict[str, Dict[str, str]]] = {}
+        # 定向重试子任务作业 id -> 原批次作业 id（直接父子关系）。
+        self._proof_retry_lineage: Dict[str, str] = {}
+        # 定向重试子任务作业 id -> {proof_id: 接受前的失败错误码}，
+        # 子任务完成时归并状态，取消/执行失败时按此回退。
+        self._proof_retry_selection: Dict[str, Dict[str, str]] = {}
         self._counter = itertools.count(1)
 
     # ------------------------------------------------------------ 入队/执行
@@ -120,6 +157,8 @@ class VerificationQueue:
         # 验证器随作业保存（不暴露在 VerificationJob 的对外字段语义里，
         # 仅执行期使用）
         self._job_verifiers(job_id, verifiers)
+        # 配置快照：作业进入验证时的验证器选择，定向重试子任务沿用。
+        self._config_snapshots[job_id] = self._verifiers[job_id]
         return job_id
 
     def run_next(self) -> Optional[BatchVerificationResult]:
@@ -138,26 +177,49 @@ class VerificationQueue:
 
         job.status = STATUS_RUNNING
         verifiers = self._verifiers.pop(job.job_id)
+        retry_parent = self._proof_retry_lineage.get(job.job_id)
         try:
             report = verify_batch_detailed(job.batch, verifiers)
         except Exception:
             # 输入/验证错误不属于四个持久状态，移除以释放调用方重试。
-            self._jobs.pop(job.job_id, None)
-            self._reports.pop(job.job_id, None)
-            self._reverify_lineage.pop(job.job_id, None)
-            self._group_reverify_lineage.pop(job.job_id, None)
+            if retry_parent is not None:
+                # 定向重试子任务执行失败：入选证明回到接受前的失败状态。
+                self._revert_proof_retry(retry_parent, job.job_id)
+            self._remove_job(job.job_id)
             raise
         job.status = STATUS_COMPLETED
         job.result = report.result
         self._reports[job.job_id] = report
+        if retry_parent is not None:
+            # 定向重试子任务完成：把逐证最新状态归并回原批次。
+            self._merge_proof_retry(retry_parent, job)
         return report.result
 
+    def _remove_job(self, job_id: str) -> None:
+        """作业执行抛错后的统一清理（四态状态机不保留悬挂作业）。"""
+        self._jobs.pop(job_id, None)
+        self._reports.pop(job_id, None)
+        self._verifiers.pop(job_id, None)
+        self._config_snapshots.pop(job_id, None)
+        self._reverify_lineage.pop(job_id, None)
+        self._group_reverify_lineage.pop(job_id, None)
+        self._proof_retry_lineage.pop(job_id, None)
+        self._proof_retry_selection.pop(job_id, None)
+
     def cancel(self, job_id: str) -> bool:
-        """取消 queued 作业并返回 ``True``；其余状态按异常约定抛出。"""
+        """取消 queued 作业并返回 ``True``；其余状态按异常约定抛出。
+
+        取消的若是定向重试子任务：入选证明回到接受前的失败状态（不视为
+        已重试），原批次汇总随之恢复。
+        """
         job = self._require_job(job_id)
         if job.status == STATUS_QUEUED:
+            retry_parent = self._proof_retry_lineage.get(job_id)
+            if retry_parent is not None:
+                self._revert_proof_retry(retry_parent, job_id)
             job.status = STATUS_CANCELLED
             self._verifiers.pop(job_id, None)
+            self._config_snapshots.pop(job_id, None)
             return True
         if job.status == STATUS_RUNNING:
             raise RunningJobError(f"job {job_id!r} is running")
@@ -415,6 +477,229 @@ class VerificationQueue:
             source.status,
             retry.status,
         )
+
+    # -------------------------------------------------------- 定向重试
+
+    def retry_failed_proofs(
+        self,
+        batch_id: Any,
+        code: Any = None,
+        proof_ids: Any = None,
+        verifiers: Any = None,
+        error_code: Any = None,
+        failure_code: Any = None,
+    ) -> ProofRetryResponse:
+        """按失败定位结果筛选证明并定向重试，返回
+        :class:`ProofRetryResponse`。
+
+        输入为原批次标识 ``batch_id``、匹配的失败错误码 ``code``
+        （``error_code``/``failure_code`` 为同义关键字别名）与可选的
+        ``proof_ids``：不提供 ``proof_ids`` 时选择批次内所有匹配错误码
+        且可重试的证明，提供时只在这些证明中筛选。系统先确认批次和证明
+        归属，再把符合条件的证明按原批次原序组成子批次（``batch_id``、
+        证明材料与分组键原样保留），作为独立的 queued 作业重新加入本
+        队列；新作业的验证状态与失败定位仍由 :meth:`result`/
+        :meth:`report` 给出。
+
+        响应逐个给出 proofId 被接受（``accepted``）或被跳过
+        （``skipped``，唯一跳过原因）。同一证明重复请求行为确定：已被
+        接受且处于待验证或验证中的记 ``already_queued``，已有最新成功
+        结果的记 ``already_completed``，已有失败定位但错误码不匹配
+        （禁止重试）的记 ``not_retryable``。筛选后没有可接受证明时请求
+        不报错：``accepted`` 为空、不创建作业（``job_id``/``status``
+        为 ``None``），``skipped`` 逐条给出原因。所有集合输出按输入
+        ``proof_ids`` 的顺序返回（未提供时按批次原序），重复项直接报
+        错而不静默去重。
+
+        ``verifiers`` 只作用于新作业，省略时沿用原批次进入验证时的
+        配置快照。校验按以下顺序依次进行，任一失败都不创建作业、不改
+        变原批次的状态或结果：
+
+        * 批次不存在（没有以 ``batch_id`` 完成验证的原批次）
+          —— :class:`BatchNotFoundError`；
+        * ``proof_ids`` 为空、元素不是非空字符串或同一请求内重复
+          —— :class:`InvalidRetrySelectionError`；
+        * ``proof_ids`` 含不属于 ``batch_id`` 的证明
+          —— :class:`ProofNotInBatchError`；
+        * 失败错误码无法识别（不在公开失败码口径内）
+          —— :class:`InvalidRetrySelectionError`。
+        """
+        if code is None:
+            code = error_code if error_code is not None else failure_code
+        root = self._find_batch_job(batch_id)
+        if root is None or root.status != STATUS_COMPLETED:
+            raise BatchNotFoundError(f"unknown batch: {batch_id!r}")
+
+        state = self._proof_retry_states.get(root.job_id)
+        if state is None:
+            state = self._init_proof_retry_state(root)
+            self._proof_retry_states[root.job_id] = state
+
+        if proof_ids is None:
+            candidates = [
+                pid
+                for pid, info in state.items()
+                if info["status"] != _PROOF_PASSED and info["code"] == code
+            ] if isinstance(code, str) else []
+        else:
+            if not isinstance(proof_ids, (list, tuple)) or len(proof_ids) == 0:
+                raise InvalidRetrySelectionError(
+                    "proof_ids must be a non-empty list or tuple of proof ids"
+                )
+            seen = set()
+            for pid in proof_ids:
+                if not isinstance(pid, str) or not pid:
+                    raise InvalidRetrySelectionError(
+                        f"proof id must be a non-empty str, got {pid!r}"
+                    )
+                if pid in seen:
+                    raise InvalidRetrySelectionError(
+                        f"duplicate proof id in retry request: {pid!r}"
+                    )
+                seen.add(pid)
+            for pid in proof_ids:
+                if pid not in state:
+                    raise ProofNotInBatchError(
+                        f"proof id {pid!r} does not belong to batch "
+                        f"{batch_id!r}"
+                    )
+            candidates = list(proof_ids)
+
+        if not isinstance(code, str) or code not in RETRYABLE_FAILURE_CODES:
+            raise InvalidRetrySelectionError(
+                f"unrecognized failure code: {code!r}"
+            )
+
+        accepted: List[str] = []
+        skipped: List[ProofRetrySkipItem] = []
+        for pid in candidates:
+            info = state[pid]
+            if info["status"] == _PROOF_QUEUED:
+                skipped.append(
+                    ProofRetrySkipItem(pid, RETRY_SKIP_ALREADY_QUEUED)
+                )
+            elif info["status"] == _PROOF_PASSED:
+                skipped.append(
+                    ProofRetrySkipItem(pid, RETRY_SKIP_ALREADY_COMPLETED)
+                )
+            elif info["code"] != code:
+                skipped.append(
+                    ProofRetrySkipItem(pid, RETRY_SKIP_NOT_RETRYABLE)
+                )
+            else:
+                accepted.append(pid)
+
+        new_job_id: Optional[str] = None
+        status: Optional[str] = None
+        if accepted:
+            # 子批次按原批次原序选证：材料、分组键、batch_id 原样保留。
+            accepted_set = set(accepted)
+            selected = [
+                raw
+                for raw in root.batch["proofs"]
+                if raw["proof_id"] in accepted_set
+            ]
+            sub_batch = {
+                "batch_id": root.result.batch_id,
+                "proofs": selected,
+            }
+            chosen_verifiers = (
+                verifiers
+                if verifiers is not None
+                else self._config_snapshots.get(root.job_id)
+            )
+            new_job_id = self.enqueue(sub_batch, chosen_verifiers)
+            self._proof_retry_lineage[new_job_id] = root.job_id
+            self._proof_retry_selection[new_job_id] = {
+                pid: state[pid]["code"] for pid in accepted
+            }
+            for pid in accepted:
+                state[pid] = {"status": _PROOF_QUEUED, "code": state[pid]["code"]}
+            status = STATUS_QUEUED
+
+        return ProofRetryResponse(
+            batch_id=root.result.batch_id,
+            source_job_id=root.job_id,
+            job_id=new_job_id,
+            status=status,
+            code=code,
+            accepted=accepted,
+            skipped=skipped,
+        )
+
+    # 同语义别名：按失败码筛选的定向重试在不同文档中的命名。
+    retry_proofs = retry_failed_proofs
+    retry_proofs_by_code = retry_failed_proofs
+    retry_proofs_by_failure_code = retry_failed_proofs
+    retry_failures_by_code = retry_failed_proofs
+    retry_by_failure_code = retry_failed_proofs
+    retry_selected_proofs = retry_failed_proofs
+    selective_retry_proofs = retry_failed_proofs
+
+    # ------------------------------------------------------------ 重试内部
+
+    def _find_batch_job(self, batch_id: Any) -> Optional[VerificationJob]:
+        """按批次标识找到原批次（普通入队）作业。
+
+        复核与定向重试产生的子任务沿用原批次 ``batch_id``，不作为独立
+        批次参与查找；取最早入队的同标识普通作业（同标识批次按单例语
+        义处理）。
+        """
+        child_ids = (
+            set(self._reverify_lineage)
+            | set(self._group_reverify_lineage)
+            | set(self._proof_retry_lineage)
+        )
+        for job in self._jobs.values():
+            if job.job_id in child_ids:
+                continue
+            batch = job.batch
+            if isinstance(batch, Mapping) and batch.get("batch_id") == batch_id:
+                return job
+        return None
+
+    def _init_proof_retry_state(
+        self, root: VerificationJob
+    ) -> Dict[str, Dict[str, str]]:
+        """按原批次已保存的结果建立逐证明当前状态（批次原序）。"""
+        failed: Dict[str, str] = {}
+        for failure in root.result.failures:
+            failed.setdefault(failure.proof_id, failure.code)
+        state: Dict[str, Dict[str, str]] = {}
+        for raw in root.batch["proofs"]:
+            proof_id = raw["proof_id"]
+            code = failed.get(proof_id)
+            if code is None:
+                state[proof_id] = {"status": _PROOF_PASSED, "code": ""}
+            else:
+                state[proof_id] = {"status": _PROOF_FAILED, "code": code}
+        return state
+
+    def _merge_proof_retry(self, root_id: str, job: VerificationJob) -> None:
+        """定向重试子任务完成：把入选证明的最新状态归并回原批次。"""
+        state = self._proof_retry_states.get(root_id)
+        selected = self._proof_retry_selection.pop(job.job_id, {})
+        if state is None:
+            return
+        failed: Dict[str, str] = {}
+        for failure in job.result.failures:
+            failed.setdefault(failure.proof_id, failure.code)
+        for proof_id in selected:
+            code = failed.get(proof_id)
+            if code is None:
+                state[proof_id] = {"status": _PROOF_PASSED, "code": ""}
+            else:
+                state[proof_id] = {"status": _PROOF_FAILED, "code": code}
+
+    def _revert_proof_retry(self, root_id: str, job_id: str) -> None:
+        """定向重试子任务被取消或执行失败：入选证明回到接受前的失败
+        状态（不视为已重试）。"""
+        state = self._proof_retry_states.get(root_id)
+        selected = self._proof_retry_selection.pop(job_id, {})
+        if state is None:
+            return
+        for proof_id, old_code in selected.items():
+            state[proof_id] = {"status": _PROOF_FAILED, "code": old_code}
 
     # ---------------------------------------------------------------- 内部
 

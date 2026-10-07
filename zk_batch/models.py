@@ -845,3 +845,73 @@ class GroupReverifyOutcomeReport:
             "recovered_count": self.recovered_count,
             "still_failed_count": self.still_failed_count,
         }
+
+
+# ====================================== 按失败码筛选的定向重试（proof retry）
+
+# 定向重试响应中逐证明的跳过原因（固定字面量）
+RETRY_SKIP_UNKNOWN_PROOF = "unknown_proof"            # 证明标识未知
+RETRY_SKIP_PROOF_NOT_IN_BATCH = "proof_not_in_batch"  # 证明不属于该批次
+RETRY_SKIP_NOT_RETRYABLE = "not_retryable"            # 有失败定位但不可重试
+RETRY_SKIP_ALREADY_QUEUED = "already_queued"          # 已接受，待验证或验证中
+RETRY_SKIP_ALREADY_COMPLETED = "already_completed"    # 已有最新成功结果
+RETRY_SKIP_REASONS = (
+    RETRY_SKIP_UNKNOWN_PROOF,
+    RETRY_SKIP_PROOF_NOT_IN_BATCH,
+    RETRY_SKIP_NOT_RETRYABLE,
+    RETRY_SKIP_ALREADY_QUEUED,
+    RETRY_SKIP_ALREADY_COMPLETED,
+)
+
+
+@dataclass(frozen=True)
+class ProofRetrySkipItem:
+    """定向重试响应中单个被跳过证明的定位。
+
+    ``reason`` 为唯一跳过原因，只取 ``unknown_proof`` /
+    ``proof_not_in_batch`` / ``not_retryable`` / ``already_queued`` /
+    ``already_completed`` 之一。只承载定位信息，不含证明材料、
+    ``public_inputs``、调用栈或未公开验证器信息。
+    """
+
+    proof_id: str
+    reason: str
+
+    def to_dict(self) -> dict:
+        return {
+            "proof_id": self.proof_id,
+            "reason": self.reason,
+        }
+
+
+@dataclass(frozen=True)
+class ProofRetryResponse:
+    """按失败码筛选的定向重试响应。
+
+    ``accepted`` 为被接受并重新加入验证队列的 proofId，``skipped`` 为
+    被跳过的 proofId 及其唯一跳过原因；两个集合都按输入 ``proof_ids``
+    的顺序排列（未提供 ``proof_ids`` 时按批次原序）。有证明被接受时
+    ``job_id`` 为新 queued 作业标识、``status`` 为 ``queued``；筛选后
+    没有可接受证明时不创建作业，``job_id`` 与 ``status`` 为 ``None``，
+    请求本身不报错。只承载定位信息，不含证明材料、``public_inputs``、
+    调用栈或未公开验证器信息。
+    """
+
+    batch_id: Any
+    source_job_id: str
+    job_id: Any
+    status: Any
+    code: str
+    accepted: List[str]
+    skipped: List[ProofRetrySkipItem]
+
+    def to_dict(self) -> dict:
+        return {
+            "batch_id": self.batch_id,
+            "source_job_id": self.source_job_id,
+            "job_id": self.job_id,
+            "status": self.status,
+            "code": self.code,
+            "accepted": list(self.accepted),
+            "skipped": [item.to_dict() for item in self.skipped],
+        }

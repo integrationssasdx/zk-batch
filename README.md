@@ -8,7 +8,10 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
 
 ## 状态
 
-初始基线：只有本说明，尚无实现。
+已实现：批量聚合验证、详细/窗口化报告、聚合冲突定位、串行验证队列
+（`reverify_failures`、`reverify_groups` 及对账）、逐项任务队列
+（调度、取消、复核与对账），以及按失败错误码筛选证明的定向重试
+（`retry_failed_proofs`）。
 
 ## 公开入口
 
@@ -134,6 +137,35 @@ ZK 证明批聚合验证服务：批量证明聚合、验证队列与失败定�
     `ResultUnavailableError`，非直接 `reverify_groups` 谱系抛
     `GroupReverifyLineageMismatchError`，三者及与
     `ReverifyLineageMismatchError` 均互不替代。
+  - `retry_failed_proofs(batch_id, code, proof_ids=None, verifiers=None)` ——
+    按失败定位结果筛选证明并定向重试，返回 `ProofRetryResponse`（固定键序
+    `to_dict`：`batch_id`、`source_job_id`、`job_id`、`status`、`code`、
+    `accepted`、`skipped`）。输入为原批次标识、匹配的失败错误码
+    （`rejected`/`verify_error`，沿用 `Failure.code` 口径）与可选
+    `proof_ids`：不提供 `proof_ids` 时选择批次内所有匹配错误码且可重试
+    的证明，提供时只在这些证明中筛选。系统先确认批次和证明归属，再把
+    符合条件的证明按原批次原序组成子批次（`batch_id`、证明材料与分组键
+    原样保留），作为独立的 queued 作业重新加入本队列；新作业的验证状态
+    与失败定位仍由既有 `result`/`report` 查询给出。`verifiers` 只作用于
+    新作业，省略时沿用原批次进入验证时的配置快照。响应中 `accepted` 为
+    被接受的 proofId，`skipped` 逐条给出被跳过 proofId 及其唯一跳过原因
+    （`ProofRetrySkipItem`，`reason` 只取 `unknown_proof`/
+    `proof_not_in_batch`/`not_retryable`/`already_queued`/
+    `already_completed`）；两个集合都按输入 `proof_ids` 的顺序返回（未
+    提供时按批次原序），重复项直接报错而不静默去重。同一证明重复请求
+    行为确定：已被接受且处于待验证或验证中的记 `already_queued`，已有
+    最新成功结果的记 `already_completed`，已有失败定位但错误码不匹配
+    （禁止重试）的记 `not_retryable`。筛选后没有可接受证明时请求不报错：
+    `accepted` 为空、不创建作业（`job_id`/`status` 为 `None`），
+    `skipped` 逐条给出原因。异常按序检查、互不替代：批次不存在（含尚未
+    完成验证的批次）`BatchNotFoundError` → `proof_ids` 为空、元素非法或
+    重复 `InvalidRetrySelectionError` → `proof_ids` 含不属于批次的证明
+    `ProofNotInBatchError` → 失败错误码无法识别
+    `InvalidRetrySelectionError`；任一失败都不创建作业、不改变原批次的
+    状态或结果。重试子任务被取消或执行失败时，入选证明回到接受前的失败
+    状态（不视为已重试）。本入口不新增文件、外部消息或持久化约定，不改
+    写历史失败结果、错误码含义、批次归属与既有请求响应格式；既有批量
+    聚合、验证队列、失败定位和结果查询保持兼容。
 - `VerificationTaskQueue` —— 可排队、可定位失败原因的**逐项**批量验证队列，
   与上面的分组聚合队列相互独立；同样不起线程、不联网、不落盘。输入是一组
   按业务顺序排列的验证项，每项含稳定标识 `item_id`（非空字符串）与证明

@@ -147,6 +147,40 @@ class GroupReverifyLineageMismatchError(QueueError):
     """
 
 
+# --------------------------------------- 按失败码筛选的定向重试（proof retry）
+
+class BatchNotFoundError(QueueError):
+    """定向重试的批次标识在队列中不存在。
+
+    以批次标识（``batch_id``）为入口查找已完成验证的原批次；找不到
+    （含批次尚未结束验证）时抛出，不创建作业、不改变任何状态。与
+    :class:`InvalidRetrySelectionError`（筛选输入非法）和
+    :class:`ProofNotInBatchError`（证明不属于批次）互不替代。
+    """
+
+
+class InvalidRetrySelectionError(QueueError):
+    """定向重试的筛选输入非法。
+
+    ``proof_ids`` 为空、元素不是非空字符串或同一请求内重复，以及失败
+    错误码无法识别时抛出；整次请求不进入队列、不创建作业。
+    """
+
+
+class ProofNotInBatchError(QueueError):
+    """``proof_ids`` 含不属于目标批次的证明。
+
+    每个提供的 proofId 都必须属于 ``batch_id`` 对应的原批次；检出时
+    整次请求不进入队列、不创建作业，批次状态与结果不变。
+    """
+
+
+# 语言中性别名：需求文档以 *Exception 命名上述异常，二者是同一类型。
+BatchNotFoundException = BatchNotFoundError
+InvalidRetrySelectionException = InvalidRetrySelectionError
+ProofNotInBatchException = ProofNotInBatchError
+
+
 # ------------------------------------------------- 排队批量验证（任务流）
 
 class TaskValidationError(ZKBatchError):
